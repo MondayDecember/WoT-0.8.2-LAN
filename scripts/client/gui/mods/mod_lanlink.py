@@ -20,6 +20,8 @@
 #   lobby    optional "address:port" of a lobby server (tools/lobby_server.py)
 #   room     optional room name: a host announces it there, a guest finds
 #            the host by it instead of host_ip
+#   token    account session from the launcher's login (with lobby): name and
+#            uid then come from the account, friends and platoon work
 #
 # Python 2.6 (the client's interpreter): no dict/set comprehensions,
 # str.format needs explicit indexes.
@@ -168,7 +170,7 @@ def _save_cfg(cfg):
 			f.close()
 	except Exception:
 		out = {}
-	for k in ('role', 'host_ip', 'port', 'name', 'uid', 'key', 'lobby', 'room'):
+	for k in ('role', 'host_ip', 'port', 'name', 'uid', 'key', 'lobby', 'room', 'token', 'account'):
 		if k in cfg:
 			out[k] = cfg[k]
 	f = open(CFG_FILE, 'w')
@@ -277,6 +279,9 @@ class LanLink(object):
 		self.candidates = []     # guest: host addresses found through the lobby
 		self.find_err = ''
 		self.my_lan_ips = None
+		self.account_ok = None   # True / False once the lobby answered our token
+		self.platoon = None      # platoon info from the lobby
+		self.platoon_warned = None
 		# frame watch
 		self.last_tick = 0.0
 		self.frames = 0
@@ -409,7 +414,7 @@ class LanLink(object):
 			# Session password (lan.json 'key'): with a public IP anyone can
 			# reach the port; without the right key the host does not answer.
 			want = self.cfg.get('key')
-			if want and _s(msg.get('key')) != _s(want):
+			if want and _s(msg.get('key')) != _s(want) and not self.platoon_secret_ok(_s(msg.get('ps'))):
 				if addr not in self.rejected:
 					self.rejected[addr] = now
 					_log('rejected %s:%d - wrong or missing key' % (addr[0], addr[1]))
@@ -590,32 +595,66 @@ class LanLink(object):
 		except Exception:
 			pass
 
+	def room(self):
+		'''The room this client hosts or looks for: its platoon's, else lan.json's.'''
+		if self.platoon and self.platoon.get('room'):
+			return _s(self.platoon.get('room'))
+		return self.cfg.get('room') or ''
+
 	def lobby_tick(self, now):
 		if now - self.last_reg >= LOBBY_REG_EVERY:
 			self.last_reg = now
 			if self.my_lan_ips is None:
 				self.my_lan_ips = self._lan_ips()
-			self.send_lobby({'t': 'reg', 'uid': self.cfg.get('uid'), 'name': self.name, 'role': self.role,
-			                 'room': self.cfg.get('room') or '', 'port': self.cfg['port'],
-			                 'state': 'battle' if self.in_lan_battle else 'hangar',
-			                 'kh': self._key_hash() if self.role == 'host' else '',
-			                 'lan': self.my_lan_ips})
+			reg = {'t': 'reg', 'uid': self.cfg.get('uid'), 'name': self.name, 'role': self.role,
+			       'client': 'game', 'room': self.room(), 'port': self.cfg['port'],
+			       'state': 'battle' if self.in_lan_battle else 'hangar',
+			       'kh': self._key_hash() if self.role == 'host' else '',
+			       'lan': self.my_lan_ips}
+			if self.cfg.get('token'):
+				reg['token'] = self.cfg.get('token')
+			self.send_lobby(reg)
 		if now - self.last_list >= LOBBY_LIST_EVERY:
 			self.last_list = now
 			self.send_lobby({'t': 'list'})
-		if (self.role == 'guest' and not self.peers and self.cfg.get('room')
+		if (self.role == 'guest' and not self.peers and self.room()
 				and now - self.last_find >= LOBBY_FIND_EVERY):
 			self.last_find = now
-			self.send_lobby({'t': 'find', 'room': self.cfg.get('room'), 'kh': self._key_hash()})
+			find = {'t': 'find', 'room': self.room(), 'kh': self._key_hash()}
+			if self.cfg.get('token'):
+				find['token'] = self.cfg.get('token')
+			self.send_lobby(find)
 
 	def handle_lobby(self, msg):
 		t = msg.get('t')
+		if t == 'regok':
+			if msg.get('err') == 'auth':
+				if self.account_ok is not False:
+					self.account_ok = False
+					self.notify(u'\u0410\u043a\u043a\u0430\u0443\u043d\u0442: \u0432\u043e\u0439\u0434\u0438\u0442\u0435 \u0437\u0430\u043d\u043e\u0432\u043e \u0432 \u043b\u0430\u0443\u043d\u0447\u0435\u0440\u0435')
+				return
+			if msg.get('account'):
+				if self.account_ok is not True:
+					self.account_ok = True
+					dbg('account ok: %s (%s)' % (_s(msg.get('name')), _s(msg.get('uid'))))
+				name = _s(msg.get('name'))
+				if name:
+					self.name = name
+			for n in msg.get('notes') or []:
+				self.notify(_u(n))
+			self.set_platoon(msg.get('platoon'))
+			return
 		if t == 'list':
 			fresh = {}
 			for e in msg.get('players') or []:
 				uid = _s(e.get('uid'))
 				if uid:
 					fresh[uid] = e
+			if self.account_ok:
+				# with an account the server sends friend notifications itself
+				self.online = fresh
+				self.online_known = True
+				return
 			if self.online_known:
 				for uid in fresh:
 					if uid not in self.online and uid != self.cfg.get('uid'):
@@ -650,6 +689,34 @@ class LanLink(object):
 			if cands != self.candidates:
 				self.candidates = cands
 				dbg('lobby: room %s host %s at %s' % (msg.get('room'), msg.get('host'), cands))
+
+	def platoon_secret_ok(self, ps):
+		'''Host: the guest showed our platoon's secret (the lobby gives it only
+		to platoon members), so it may join without the room key.'''
+		if not ps or not self.platoon:
+			return False
+		return ps == _s(self.platoon.get('secret'))
+
+	def set_platoon(self, pl):
+		'''Platoon from the lobby. The leader plays as host, members as guests
+		of the leader; a client started in the other role is told to restart.'''
+		self.platoon = pl or None
+		key = None
+		if pl:
+			leader = _s(pl.get('leader'))
+			mine = _s(self.cfg.get('uid'))
+			want = 'host' if leader == mine else 'guest'
+			key = (leader, want)
+			if want != self.role and self.platoon_warned != key:
+				self.platoon_warned = key
+				self.notify(u'\u0412\u0437\u0432\u043e\u0434: \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0438\u0433\u0440\u0443 \u0447\u0435\u0440\u0435\u0437 \u043b\u0430\u0443\u043d\u0447\u0435\u0440')
+			if want == 'guest' and self.role == 'guest' and self.peers:
+				# connected to someone else than the platoon leader: drop it, find the leader
+				for a, p in list(self.peers.items()):
+					if p.uid and p.uid != leader:
+						dbg('platoon: leaving %s for leader %s' % (p.name, _s(pl.get('leader_name'))))
+						del self.peers[a]
+						self.candidates = []
 
 	def _who(self, e):
 		role = _s(e.get('role'))
@@ -1033,6 +1100,13 @@ class LanLink(object):
 			dbg('stats saved: %s' % ', '.join(['%s %d dmg %d frags' % (r[1], r[3], r[4]) for r in rows]))
 		except Exception as e:
 			dbg('stats save failed: %r' % (e,))
+		# accounts: the lobby keeps everyone's stats in one place
+		if self.lobby_addr is not None and self.cfg.get('token'):
+			msg = {'t': 'stats_add', 'token': self.cfg.get('token'),
+			       'battle': {'id': '%s:%s' % (self.cfg.get('uid'), self.battle_id), 'winner': int(winner),
+			                  'rows': [[r[0], r[1], r[2], int(r[3]), int(r[4]), 1 if r[5] else 0] for r in rows]}}
+			for _i in range(3):   # unreliable channel: a few copies, the lobby de-duplicates
+				self.send_lobby(dict(msg))
 
 	def take_capture_changes(self):
 		'''Guest: [(team, [points, interrupted])] that changed since last asked.'''
@@ -1134,7 +1208,8 @@ class LanLink(object):
 			if self.host_addr is not None and self.host_addr not in targets:
 				targets.append(self.host_addr)
 			for a in targets:
-				self.send(a, {'t': 'hello', 'name': self.name, 'uid': self.cfg.get('uid'), 'key': self.cfg.get('key')})
+				self.send(a, {'t': 'hello', 'name': self.name, 'uid': self.cfg.get('uid'), 'key': self.cfg.get('key'),
+				              'ps': _s((self.platoon or {}).get('secret')) or None})
 
 		if self.lobby_addr is not None:
 			self.lobby_tick(now)
@@ -1181,9 +1256,13 @@ class LanLink(object):
 		lines = ['role: %s  name: %s  id: %s  uid: %s  uptime: %ds' % (self.role, self.name, self.my_id, self.cfg.get('uid'), int(time.time() - self.started))]
 		if self.role == 'guest':
 			lines.append('host: %s' % ('%s:%d' % self.host_addr if self.host_addr else 'not known yet'))
+		if self.cfg.get('token'):
+			lines.append('account: %s  %s  platoon: %s' % (
+				self.cfg.get('account') or '-', {True: 'ok', False: 'LOGIN AGAIN', None: '...'}[self.account_ok],
+				', '.join([_s(m.get('name')) for m in (self.platoon or {}).get('members', [])]) or '-'))
 		if self.lobby_addr is not None or self.lobby_err:
 			lines.append('lobby: %s  room: %s  online: %s%s' % (
-				'%s:%d' % self.lobby_addr if self.lobby_addr else '-', self.cfg.get('room') or '-',
+				'%s:%d' % self.lobby_addr if self.lobby_addr else '-', self.room() or '-',
 				', '.join([_s(e.get('name')) for e in self.online.values()]) or '-',
 				('  error: ' + self.lobby_err) if self.lobby_err else (('  find: ' + self.find_err) if self.find_err else '')))
 		if not self.peers:

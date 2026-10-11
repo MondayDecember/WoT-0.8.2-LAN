@@ -1,0 +1,17 @@
+# systemd unit for the WoT LAN lobby/account server on Linux.
+#   sudo cp lobby_server.py /opt/wotlan/ && sudo cp wotlan-lobby.service /etc/systemd/system/
+#   sudo systemctl enable --now wotlan-lobby
+[Unit]
+Description=WoT 0.8.2 LAN lobby and account server
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/wotlan/lobby_server.py --port 27016 --data /var/lib/wotlan
+Restart=always
+RestartSec=5
+DynamicUser=yes
+StateDirectory=wotlan
+WorkingDirectory=/opt/wotlan
+
+[Install]
+WantedBy=multi-user.target

@@ -165,7 +165,10 @@ class Server(object):
         return {'leader': leader, 'leader_name': self.name_of(leader),
                 'members': [{'uid': m, 'name': self.name_of(m), 'status': self.status_of(m)} for m in pl['members']],
                 'invited': [{'uid': u, 'name': self.name_of(u)} for u in pl['invited']],
-                'room': 'pl:' + leader}
+                'room': 'pl:' + leader,
+                # members show this to the leader's game instead of the room key;
+                # only members ever receive it (in their authenticated regok)
+                'secret': pl.get('secret', '')}
 
     def friends_of(self, uid):
         return self.d['friends'].setdefault(uid, [])
@@ -454,7 +457,7 @@ class Server(object):
             return {'err': 'Приглашает командир взвода'}
         pl = self.platoons.get(me)
         if pl is None:
-            pl = {'members': [me], 'invited': {}}
+            pl = {'members': [me], 'invited': {}, 'secret': secrets.token_hex(8)}
             self.platoons[me] = pl
             self.member_of[me] = me
         if them in pl['members']:

@@ -161,6 +161,38 @@ In `lan.json` (or the launcher) of everyone:
 - The lobby only hands the address to a guest whose key hash matches the
   host's; the key itself never leaves the clients.
 
+## Accounts, friends, platoon
+
+The lobby server (`tools/lobby_server.py`) also keeps accounts. Install it
+on the always-on machine:
+
+- Windows: elevated PowerShell in `tools`:
+  `powershell -ExecutionPolicy Bypass -File install_lobby_windows.ps1`
+  (needs Python 3; adds the firewall rule and a boot-time scheduled task).
+- Linux: `tools/wotlan-lobby.service` (systemd).
+
+Forward UDP 27016 on the router to that machine.
+
+Everyone logs in in the launcher (server address, login, password; first
+time: Регистрация with a nickname). The launcher writes the session token,
+account uid and nickname into `lan.json`; the game uses them.
+
+- **Friends** tab: add by nickname, accept requests, see who is online
+  (launcher / hangar / battle), invite to the platoon.
+- **Platoon** tab: accept invitations, leave, the leader can kick. Up to 5.
+- The leader's game runs as host on room `pl:<leader>`; members' games find
+  the leader through the lobby and join with the platoon's secret (no IP,
+  no room key needed). After joining a platoon while the game is running,
+  restart it with Играть.
+- Notifications (friend online/offline, requests, invitations) appear in the
+  launcher and in the hangar.
+- Stats: the host sends each LAN battle to the lobby; the Статистика tab of a
+  logged-in launcher shows everyone's totals.
+
+Passwords: the client sends sha256("wotlan:" + login + ":" + password); the
+server stores a salted PBKDF2 of that and hands out 30-day session tokens.
+The UDP channel itself is not encrypted - do not reuse an important password.
+
 ## Playing over the internet
 
 With a public (white) IP on the host's router:
