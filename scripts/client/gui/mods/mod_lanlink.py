@@ -35,6 +35,7 @@ USER_DIR = 'offhangar_user'
 CFG_FILE = os.path.join(USER_DIR, 'lan.json')
 STATUS_FILE = os.path.join(USER_DIR, 'lanlink.txt')
 DEBUG_FILE = os.path.join(USER_DIR, 'lan_debug.log')
+STATS_FILE = os.path.join(USER_DIR, 'lan_stats.json')
 SLOW_FRAME = 0.25      # a gap between two ticks longer than this gets logged
 
 DEFAULT_CFG = {
@@ -234,6 +235,7 @@ class LanLink(object):
 		self.shots_in = []       # shot events to play on this client
 		self.damage_in = []      # host: (eid, dmg, pid) hits reported by guests
 		self.end_msg = None      # guest: (winner, reason) from the host
+		self.stats_done = None   # host: battle id already booked in lan_stats.json
 		self.shots_sent = 0
 		self.shots_got = 0
 		self.dmg_sent = 0
@@ -754,6 +756,60 @@ class LanLink(object):
 		m = self.end_msg
 		self.end_msg = None
 		return m
+
+	def players_in_battle(self):
+		'''Host: [(pid, uid, name, entity id on this client)] of everyone in
+		the current LAN battle, the host first (entity id None = our own
+		player vehicle).'''
+		out = [(HOST_ID, self.cfg.get('uid'), self.name, None)]
+		for p in self.peers.values():
+			if p.veh_bid == self.battle_id and p.pid in self.remote_eids:
+				out.append((p.pid, p.uid, p.name, self.remote_eids[p.pid]))
+		return out
+
+	def record_battle(self, rows, winner):
+		'''Host: add one finished LAN battle to lan_stats.json.
+		rows: [(uid, name, team, damage, frags, alive)]'''
+		if self.role != 'host' or not self.in_lan_battle or self.stats_done == self.battle_id:
+			return
+		self.stats_done = self.battle_id
+		db = {}
+		try:
+			if os.path.isfile(STATS_FILE):
+				f = open(STATS_FILE, 'r')
+				try:
+					db = json.load(f)
+				finally:
+					f.close()
+		except Exception as e:
+			dbg('stats file unreadable, starting a new one: %r' % (e,))
+			db = {}
+		players = db.setdefault('players', {})
+		db['battles'] = int(db.get('battles', 0)) + 1
+		for uid, name, team, damage, frags, alive in rows:
+			if not uid:
+				continue
+			st = players.setdefault(uid, {'battles': 0, 'wins': 0, 'draws': 0, 'damage': 0, 'frags': 0, 'survived': 0})
+			st['name'] = name
+			st['battles'] = int(st.get('battles', 0)) + 1
+			if winner == 0:
+				st['draws'] = int(st.get('draws', 0)) + 1
+			elif winner == team:
+				st['wins'] = int(st.get('wins', 0)) + 1
+			st['damage'] = int(st.get('damage', 0)) + int(damage)
+			st['frags'] = int(st.get('frags', 0)) + int(frags)
+			if alive:
+				st['survived'] = int(st.get('survived', 0)) + 1
+			st['last'] = time.strftime('%Y-%m-%d %H:%M')
+		try:
+			f = open(STATS_FILE, 'w')
+			try:
+				json.dump(db, f, indent=2, sort_keys=True)
+			finally:
+				f.close()
+			dbg('stats saved: %s' % ', '.join(['%s %d dmg %d frags' % (r[1], r[3], r[4]) for r in rows]))
+		except Exception as e:
+			dbg('stats save failed: %r' % (e,))
 
 	def take_damage(self):
 		out = self.damage_in

@@ -6670,6 +6670,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_lan_e = _offh_lan()
 				if _lan_e is not None and _lan_e.role == 'host' and _lan_e.in_lan_battle:
 					_lan_e.send_end(winner, reason)
+					_offh_lan_book_stats(_lan_e, winner)
 			except Exception:
 				pass
 			try:
@@ -6975,6 +6976,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_lan_c = _offh_lan()
 							if _lan_c is not None and _lan_c.role == 'host' and _lan_c.in_lan_battle:
 								_lan_c.send_end(3 - base_team, 'base captured')
+								_offh_lan_book_stats(_lan_c, 3 - base_team)
 						except Exception:
 							pass
 						def _capture_end():
@@ -17248,6 +17250,34 @@ def _offh_lan_bot_state(eid, m_veh, p_vid):
 	        round(mt.yaw, 3), round(mt.pitch, 3), round(mt.roll, 3),
 	        round(getattr(m_veh, '_turret_yaw', 0.0) or 0.0, 3), round(getattr(m_veh, '_gun_pitch', 0.0) or 0.0, 3),
 	        round(getattr(m_veh, '_veh_velocity', 0.0) or 0.0, 1), int(getattr(m_veh, 'health', 0) or 0), sv]
+
+
+def _offh_lan_book_stats(lan, winner):
+	"""Host: put this battle's numbers for every player into lan_stats.json -
+	damage and frags from the battle ledger (guests' hits are booked there
+	under their tank's id when the host applies them)."""
+	try:
+		import BigWorld
+		from gui.mods.offhangar import battle_ledger as _BL
+		ledger = _BL.get()
+		player = BigWorld.player()
+		p_vid = getattr(player, 'playerVehicleID', -1)
+		mocks = globals().get('G_MOCK_VEHICLES', {}) or {}
+		allies = []
+		for vid, m in mocks.items():
+			team = getattr(m, '_bot_team', None)
+			if vid == p_vid or team == 1:
+				allies.append(vid)
+		rows = []
+		for pid, uid, name, eid in lan.players_in_battle():
+			vid = p_vid if eid is None else eid
+			tot = ledger.totals_for(vid, allies)
+			m = mocks.get(vid)
+			alive = m is not None and (getattr(m, 'health', 0) or 0) > 0
+			rows.append((uid, name, 1, tot.get('damageDealt', 0), tot.get('kills', 0), alive))
+		lan.record_battle(rows, winner)
+	except Exception as e:
+		_offh_lan_dbg('stats booking failed: %r' % (e,))
 
 
 def _offh_lan_guest_follows():
