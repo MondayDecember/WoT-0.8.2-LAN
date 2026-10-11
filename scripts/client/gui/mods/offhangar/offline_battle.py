@@ -10241,6 +10241,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_lan_pm = mock_vehicles.get(_p_vid)
 							if _lan_own is not None and _lan_pm is not None:
 								_offh_lan_apply_own_hp(player, _lan_pm, _lan_own, _lan_t, _p_vid)
+								_lan_apply_own_damage(_lan_pm, _lan_own)
 					except Exception:
 						pass
 				# Bot navigation only matters where the bot AI runs: a LAN guest's bots
@@ -12096,7 +12097,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_lk = getattr(_lbm, 'last_killer_id', -1)
 							if _lk is None: _lk = -1
 							if _lk == _p_vid: _lk = 'host'
-							_lan_pl[_lpid] = [_lhp, 1 if (_lhp > 0 and getattr(_lbm, 'isAlive', True)) else 0, _lk]
+							_lan_pl[_lpid] = [_lhp, 1 if (_lhp > 0 and getattr(_lbm, 'isAlive', True)) else 0, _lk,
+								sorted(getattr(_lbm, '_destroyed_devices', None) or []),
+								sorted(getattr(_lbm, '_crew_ko', None) or []),
+								1 if getattr(_lbm, 'is_on_fire', False) else 0]
 						_lan_cap = {}
 						try:
 							for _lct, _lcs in (globals().get('g_base_capture') or {}).items():
@@ -13206,6 +13210,41 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# side, which is what the real 0.8.2 Avatar sends.
 				return name[:-6] if name.endswith('Health') else name
 			
+			def _lan_apply_own_damage(pm, st):
+				# LAN guest: module, crew and fire hits the host's bots dealt to our
+				# tank. Only NEW ones (since the last snapshot) are applied - repair,
+				# medkits and extinguishers then run here as usual, so the host's
+				# copy (which does not repair) cannot keep re-breaking them.
+				try:
+					if len(st) < 6:
+						return
+					devs = set([str(d) for d in (st[3] or [])])
+					prev = getattr(pm, '_lan_host_devs', None) or set()
+					pm._lan_host_devs = devs
+					changed = False
+					for d in devs - prev:
+						ds = _dev_destroyed_set(pm)
+						if d not in ds:
+							ds.add(d)
+							changed = True
+							_push_device_ui(pm, True, d, 0, 1, 'destroyed')
+							_offh_lan_dbg('own module destroyed (host): %s' % d)
+					if changed:
+						_refresh_mobility_flags(pm)
+					crew = set([str(c) for c in (st[4] or [])])
+					prevc = getattr(pm, '_lan_host_crew', None) or set()
+					pm._lan_host_crew = crew
+					for c in crew - prevc:
+						if _knock_out_crew(pm, c, True):
+							_offh_lan_dbg('own crew down (host): %s' % c)
+					fire = bool(st[5])
+					if fire and not getattr(pm, '_lan_host_fire', False) and not getattr(pm, 'is_on_fire', False):
+						_offh_ignite(pm, True, 'hit (host)')
+						_offh_lan_dbg('own tank on fire (host)')
+					pm._lan_host_fire = fire
+				except Exception as _lde:
+					_offh_lan_dbg('own damage sync error: %r' % (_lde,))
+
 			def _refresh_mobility_flags(mock):
 				# A destroyed track/engine is functional again only once auto-repair reaches
 				# ~50% (the repair tick drops it from the set), so gameplay keys off the

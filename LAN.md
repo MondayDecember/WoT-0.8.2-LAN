@@ -12,6 +12,7 @@ Goal: several players in one offline battle, one PC acting as the host.
 | 2.2 | Players see each other's tanks (position, hull, turret, gun) | done |
 | 2.3 | Guest bots follow the host's simulation | done (verify on two PCs) |
 | 3 | Shooting, damage, deaths decided by the host | testing |
+| 3+ | Capture bar, results, stats, chat, lobby, launcher, module crits | testing |
 | 4 | Play over the internet (WireGuard / port forward) | todo |
 
 ## Setup
@@ -101,9 +102,43 @@ reliable) and the guest finishes the battle the same way. While a guest is
 in a LAN battle and still hears its host, its own end checks and base
 capture are off; if the host disappears, the guest falls back to its own.
 
-Not synced yet: module/crew crits and fires on a guest's own tank (only hit
-points), hit sparks at the target on other clients, the base capture bar
-on guests, the post-battle results screen.
+Guests see the host's base capture bar (points ride on the bot snapshot).
+
+At the end the host also sends its battle ledger; the guest loads it (ids
+mapped) before its results screen is built, so every player's damage, hits
+and frags there are the host's numbers.
+
+## Damage to a guest's tank beyond hit points
+
+The snapshot's player entries carry the host-side tank's destroyed modules,
+downed crew and fire. A guest applies only what is NEW since the previous
+snapshot (damage panel, crew voice, mobility flags, fire); repair, medkits
+and extinguishers then run on the guest as usual.
+
+## Chat
+
+- F5 / F6 / F7 in a LAN battle: quick messages to everyone
+  ("Атакую!", "Нужна помощь!", "Отступаем!").
+- Typed chat: the client's broadcast chat command is forwarded (the action
+  id comes from chat_shared; every chat command is logged to lan_debug.log
+  so this can be verified in game).
+- Incoming lines: battle chat in battle, notifications in the hangar.
+
+## Stats
+
+The host books every LAN battle into `offhangar_user/lan_stats.json` by
+player uid: battles, wins, draws, damage, frags, survived, last played.
+The launcher's Статистика tab shows it.
+
+## Launcher
+
+Copy `tools/WoT-LAN-Launcher.ps1` and `tools/WoT LAN.cmd` into the game
+folder and start `WoT LAN.cmd`: nickname, host / join / solo, host IP, port,
+password, lobby and room; it writes `lan.json` and starts the game, and shows
+the link status while open.
+
+Not synced yet: hit sparks at the target on other clients, module damage
+that is not a full destruction (yellow modules) on a guest.
 
 ## Lobby (optional): online list and joining by room name
 
