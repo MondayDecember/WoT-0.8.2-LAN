@@ -17226,6 +17226,25 @@ def _offh_lan_bot_state(eid, m_veh, p_vid):
 	        round(getattr(m_veh, '_veh_velocity', 0.0) or 0.0, 1), int(getattr(m_veh, 'health', 0) or 0), sv]
 
 
+def _offh_lan_guest_blocked():
+	"""A guest connected to a host does not start battles on its own: the host
+	starts them for everyone. Pressing Battle there only says so. Returns True
+	when the press must be ignored. Without a host the guest plays solo."""
+	try:
+		lan = _offh_lan()
+		if lan is None or lan.role != 'guest' or not lan.peers or lan.pending_start:
+			return False
+		_offh_lan_dbg('guest pressed Battle: ignored, the host starts the battle')
+		try:
+			from gui.SystemMessages import SM_TYPE, pushMessage
+			pushMessage(u'\u0412\u044b \u0432\u043e \u0432\u0437\u0432\u043e\u0434\u0435 \u0441 \u0445\u043e\u0441\u0442\u043e\u043c: \u0431\u043e\u0439 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0435\u0442 \u0445\u043e\u0441\u0442.'.encode('utf-8'), SM_TYPE.Warning)
+		except Exception:
+			pass
+		return True
+	except Exception:
+		return False
+
+
 def _step_on_enqueued(player, vehInvID, cmdName):
 	try:
 		_enable_offline_battle_transition(player)
@@ -17352,6 +17371,8 @@ def schedule_random_battle_flow_after_enqueue(cmd, cmdName, args):
 		player = BigWorld.player()
 		if player is None or not getattr(player, 'isOffline', False):
 			return
+		if _offh_lan_guest_blocked():
+			return
 		player._offhangar_arena_created_once = False
 		player._offhangar_queue_cancelled = False
 		vehInvID = int1
@@ -17394,6 +17415,8 @@ def start_offline_random_from_hangar(player, vehInvID):
 		return
 	if player is None:
 		LOG_DEBUG('OfflineBattle.disabled start player is None')
+		return
+	if _offh_lan_guest_blocked():
 		return
 	# Never boot a second battle on top of a running one: the account keeps
 	# receiving key events in battle, so F12 mid-battle (or mid-loading)
