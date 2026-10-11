@@ -17,6 +17,9 @@
 #   name     nickname shown to the other players
 #   key      optional session password; must be the same on host and guests
 #   uid      permanent player id, generated on first start
+#   lobby    optional "address:port" of a lobby server (tools/lobby_server.py)
+#   room     optional room name: a host announces it there, a guest finds
+#            the host by it instead of host_ip
 #
 # Python 2.6 (the client's interpreter): no dict/set comprehensions,
 # str.format needs explicit indexes.
@@ -31,6 +34,10 @@ import zlib
 import BigWorld
 
 PROTO = 'WOTLAN3'
+LOBBY_PROTO = 'WOTLOBBY1'
+LOBBY_REG_EVERY = 5.0
+LOBBY_LIST_EVERY = 10.0
+LOBBY_FIND_EVERY = 2.0
 USER_DIR = 'offhangar_user'
 CFG_FILE = os.path.join(USER_DIR, 'lan.json')
 STATUS_FILE = os.path.join(USER_DIR, 'lanlink.txt')
@@ -87,6 +94,17 @@ def dbg(msg):
 			f.close()
 	except Exception:
 		pass
+
+
+def _u(v):
+	if isinstance(v, str):
+		try:
+			return v.decode('utf-8')
+		except Exception:
+			return v.decode('latin-1')
+	if v is None:
+		return u''
+	return v
 
 
 def _s(v):
@@ -146,7 +164,7 @@ def _save_cfg(cfg):
 			f.close()
 	except Exception:
 		out = {}
-	for k in ('role', 'host_ip', 'port', 'name', 'uid', 'key'):
+	for k in ('role', 'host_ip', 'port', 'name', 'uid', 'key', 'lobby', 'room'):
 		if k in cfg:
 			out[k] = cfg[k]
 	f = open(CFG_FILE, 'w')
@@ -243,6 +261,17 @@ class LanLink(object):
 		self.dmg_sent = 0
 		self.dmg_got = 0
 		self.last_event = ''
+		# lobby
+		self.lobby_addr = None
+		self.lobby_err = ''
+		self.last_reg = 0.0
+		self.last_list = 0.0
+		self.last_find = 0.0
+		self.online = {}         # uid -> entry from the lobby's list
+		self.online_known = False
+		self.candidates = []     # guest: host addresses found through the lobby
+		self.find_err = ''
+		self.my_lan_ips = None
 		# frame watch
 		self.last_tick = 0.0
 		self.frames = 0
@@ -269,9 +298,27 @@ class LanLink(object):
 		_log('started as %s, bound 0.0.0.0:%d' % (self.role, s.getsockname()[1]))
 		dbg('started as %s %s' % (self.role, self.name))
 		if self.role == 'guest':
-			self.host_addr = (str(self.cfg['host_ip']), self.cfg['port'])
-			_log('will connect to %s:%d' % self.host_addr)
+			hip = str(self.cfg.get('host_ip') or '').strip()
+			if hip:
+				self.host_addr = (hip, self.cfg['port'])
+				_log('will connect to %s:%d' % self.host_addr)
+		self._resolve_lobby()
 		BigWorld.callback(TICK, self.tick)
+
+	def _resolve_lobby(self):
+		spec = str(self.cfg.get('lobby') or '').strip()
+		if not spec:
+			return
+		try:
+			hostpart, _, portpart = spec.rpartition(':')
+			if not hostpart:
+				hostpart, portpart = spec, '27016'
+			self.lobby_addr = (socket.gethostbyname(hostpart), int(portpart))
+			_log('lobby %s -> %s:%d' % (spec, self.lobby_addr[0], self.lobby_addr[1]))
+			dbg('lobby %s:%d, room %s' % (self.lobby_addr[0], self.lobby_addr[1], self.cfg.get('room')))
+		except Exception as e:
+			self.lobby_err = 'cannot resolve %s: %r' % (spec, e)
+			_log('lobby ' + self.lobby_err)
 
 	def send(self, addr, msg):
 		msg['p'] = PROTO
@@ -316,7 +363,7 @@ class LanLink(object):
 				msg = json.loads(data)
 			except Exception:
 				continue
-			if not isinstance(msg, dict) or msg.get('p') != PROTO:
+			if not isinstance(msg, dict) or msg.get('p') not in (PROTO, LOBBY_PROTO):
 				continue
 			out.append((msg, addr))
 		return out
@@ -329,6 +376,11 @@ class LanLink(object):
 		peer = self.peers.get(addr)
 		if peer is not None:
 			peer.last_seen = now
+
+		if msg.get('p') == LOBBY_PROTO:
+			if self.lobby_addr is not None and addr == self.lobby_addr:
+				self.handle_lobby(msg)
+			return
 
 		# Until the handshake is done only handshake traffic counts. A reliable
 		# message must not be acked by a client that cannot act on it yet, or
@@ -370,6 +422,7 @@ class LanLink(object):
 
 		elif t == 'welcome' and self.role == 'guest':
 			if peer is None:
+				self.host_addr = addr
 				peer = Peer(addr, _s(msg.get('name', '?')), HOST_ID)
 				peer.uid = _s(msg.get('uid'))
 				self.peers[addr] = peer
@@ -493,6 +546,109 @@ class LanLink(object):
 				for a, p in self.peers.items():
 					if a != addr:
 						self.send(a, dict(msg))
+
+	# --- lobby -------------------------------------------------------------------
+
+	def _key_hash(self):
+		key = self.cfg.get('key') or ''
+		if not key:
+			return ''
+		try:
+			import hashlib
+			return hashlib.sha1('wotlan:' + _s(key)).hexdigest()
+		except Exception:
+			return ''
+
+	def _lan_ips(self):
+		try:
+			ips = socket.gethostbyname_ex(socket.gethostname())[2]
+			return [ip for ip in ips if not ip.startswith('127.')][:4]
+		except Exception:
+			return []
+
+	def send_lobby(self, msg):
+		msg['p'] = LOBBY_PROTO
+		try:
+			self.sock.sendto(json.dumps(msg), self.lobby_addr)
+		except Exception:
+			pass
+
+	def lobby_tick(self, now):
+		if now - self.last_reg >= LOBBY_REG_EVERY:
+			self.last_reg = now
+			if self.my_lan_ips is None:
+				self.my_lan_ips = self._lan_ips()
+			self.send_lobby({'t': 'reg', 'uid': self.cfg.get('uid'), 'name': self.name, 'role': self.role,
+			                 'room': self.cfg.get('room') or '', 'port': self.cfg['port'],
+			                 'state': 'battle' if self.in_lan_battle else 'hangar',
+			                 'kh': self._key_hash() if self.role == 'host' else '',
+			                 'lan': self.my_lan_ips})
+		if now - self.last_list >= LOBBY_LIST_EVERY:
+			self.last_list = now
+			self.send_lobby({'t': 'list'})
+		if (self.role == 'guest' and not self.peers and self.cfg.get('room')
+				and now - self.last_find >= LOBBY_FIND_EVERY):
+			self.last_find = now
+			self.send_lobby({'t': 'find', 'room': self.cfg.get('room'), 'kh': self._key_hash()})
+
+	def handle_lobby(self, msg):
+		t = msg.get('t')
+		if t == 'list':
+			fresh = {}
+			for e in msg.get('players') or []:
+				uid = _s(e.get('uid'))
+				if uid:
+					fresh[uid] = e
+			if self.online_known:
+				for uid in fresh:
+					if uid not in self.online and uid != self.cfg.get('uid'):
+						self.notify(u'%s \u0432 \u0441\u0435\u0442\u0438%s' % (
+							_u(fresh[uid].get('name')), self._who(fresh[uid])))
+				for uid in self.online:
+					if uid not in fresh and uid != self.cfg.get('uid'):
+						self.notify(u'%s \u0432\u044b\u0448\u0435\u043b' % _u(self.online[uid].get('name')))
+			else:
+				others = [e for u, e in fresh.items() if u != self.cfg.get('uid')]
+				if others:
+					self.notify(u'\u0412 \u0441\u0435\u0442\u0438: ' + u', '.join(
+						[_u(e.get('name')) + self._who(e) for e in others]))
+			self.online = fresh
+			self.online_known = True
+		elif t == 'found':
+			err = _s(msg.get('err') or '')
+			if err:
+				if err != self.find_err:
+					self.find_err = err
+					dbg('lobby: room %s - %s' % (msg.get('room'), err))
+					if err == 'key':
+						self.notify(u'\u041b\u043e\u0431\u0431\u0438: \u043d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u043f\u0430\u0440\u043e\u043b\u044c \u043a\u043e\u043c\u043d\u0430\u0442\u044b')
+				return
+			self.find_err = ''
+			cands = []
+			for a in msg.get('addrs') or []:
+				try:
+					cands.append((_s(a[0]), int(a[1])))
+				except Exception:
+					pass
+			if cands != self.candidates:
+				self.candidates = cands
+				dbg('lobby: room %s host %s at %s' % (msg.get('room'), msg.get('host'), cands))
+
+	def _who(self, e):
+		role = _s(e.get('role'))
+		room = _u(e.get('room') or '')
+		if role == 'host':
+			return u' (\u0445\u043e\u0441\u0442%s)' % ((u', ' + room) if room else u'')
+		return u''
+
+	def notify(self, text):
+		'''A line in the hangar's notification list (and the debug log).'''
+		dbg(_s(text))
+		try:
+			from gui.SystemMessages import SM_TYPE, pushMessage
+			pushMessage(_s(text), SM_TYPE.Information)
+		except Exception:
+			pass
 
 	# --- battle sync: start -------------------------------------------------
 
@@ -906,7 +1062,14 @@ class LanLink(object):
 
 		if self.role == 'guest' and not self.peers and now - self.last_hello >= 1.0:
 			self.last_hello = now
-			self.send(self.host_addr, {'t': 'hello', 'name': self.name, 'uid': self.cfg.get('uid'), 'key': self.cfg.get('key')})
+			targets = list(self.candidates)
+			if self.host_addr is not None and self.host_addr not in targets:
+				targets.append(self.host_addr)
+			for a in targets:
+				self.send(a, {'t': 'hello', 'name': self.name, 'uid': self.cfg.get('uid'), 'key': self.cfg.get('key')})
+
+		if self.lobby_addr is not None:
+			self.lobby_tick(now)
 
 		for key in list(self.pending.keys()):
 			entry = self.pending.get(key)
@@ -949,7 +1112,12 @@ class LanLink(object):
 	def write_status(self):
 		lines = ['role: %s  name: %s  id: %s  uid: %s  uptime: %ds' % (self.role, self.name, self.my_id, self.cfg.get('uid'), int(time.time() - self.started))]
 		if self.role == 'guest':
-			lines.append('host: %s:%d' % self.host_addr)
+			lines.append('host: %s' % ('%s:%d' % self.host_addr if self.host_addr else 'not known yet'))
+		if self.lobby_addr is not None or self.lobby_err:
+			lines.append('lobby: %s  room: %s  online: %s%s' % (
+				'%s:%d' % self.lobby_addr if self.lobby_addr else '-', self.cfg.get('room') or '-',
+				', '.join([_s(e.get('name')) for e in self.online.values()]) or '-',
+				('  error: ' + self.lobby_err) if self.lobby_err else (('  find: ' + self.find_err) if self.find_err else '')))
 		if not self.peers:
 			lines.append('peers: none' + (' (waiting for host...)' if self.role == 'guest' else ' (waiting for guests...)'))
 		for addr, p in self.peers.items():

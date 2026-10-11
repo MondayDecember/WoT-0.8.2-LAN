@@ -105,6 +105,27 @@ Not synced yet: module/crew crits and fires on a guest's own tank (only hit
 points), hit sparks at the target on other clients, the base capture bar
 on guests, the post-battle results screen.
 
+## Lobby (optional): online list and joining by room name
+
+`tools/lobby_server.py` is a tiny UDP server (Python 3, standard library,
+stores nothing on disk). Run it on any always-on machine with a public IP
+and forward **UDP 27016** to it (`tools/lobby_server.cmd` on Windows, or
+`python3 lobby_server.py` on Linux).
+
+In `lan.json` (or the launcher) of everyone:
+
+```json
+"lobby": "<lobby address>:27016", "room": "tanki"
+```
+
+- Everyone registers every 5 s; the hangar's notification list says who is
+  online, who came and who left (`X в сети`, `X вышел`), hosts with their room.
+- A guest with a `room` and no `host_ip` asks the lobby for that room's host
+  and gets its public and LAN addresses - no IP to type in. The host's game
+  port must still be reachable (forwarded) for guests outside its LAN.
+- The lobby only hands the address to a guest whose key hash matches the
+  host's; the key itself never leaves the clients.
+
 ## Playing over the internet
 
 With a public (white) IP on the host's router:
