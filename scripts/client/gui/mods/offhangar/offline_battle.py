@@ -15984,6 +15984,32 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if _k < len(_t1): _jobs.append(_t1[_k])
 						if _k < len(_t2): _jobs.append(_t2[_k])
 					
+					# LAN: the host's line-up is the line-up. The host publishes the
+					# jobs it just rolled; a guest in a LAN battle waits for them and
+					# spawns exactly those (same tanks, same slots, same order - so the
+					# bot ids 1000+n match on both sides).
+					try:
+						_lan = _offh_lan()
+						if _lan is not None and _lan.in_lan_battle:
+							if _lan.role == 'host':
+								_lan.host_set_plan(_jobs)
+							elif _lan.role == 'guest':
+								_plan = _lan.guest_plan()
+								if _plan is None:
+									_waited = getattr(_pl, '_offh_lan_plan_wait', 0)
+									if _waited < 120:
+										_pl._offh_lan_plan_wait = _waited + 1
+										BigWorld.callback(0.5, _auto_spawn_teams)
+										return
+									LOG_DEBUG('LAN: no line-up from host after 60 s, using own bots')
+								else:
+									_jobs = list(_plan)
+									LOG_DEBUG('LAN: using host line-up, %d bots' % len(_jobs))
+							_pl._offh_lan_plan_wait = 0
+					except Exception:
+						import traceback
+						LOG_DEBUG('LAN line-up sync failed:', traceback.format_exc())
+
 					def _spawn_next(_rest):
 						if _battle_finished[0] or not _rest:
 							return
@@ -16691,10 +16717,26 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 	LOG_DEBUG('OfflineBattle.spawnAvatar.fail', cmdName)
 	return
 
+def _offh_lan():
+	'''LAN link (mod_lanlink) or None when LAN is off / not installed.'''
+	try:
+		import sys
+		m = sys.modules.get('gui.mods.mod_lanlink')
+		return m.get() if m is not None else None
+	except Exception:
+		return None
+
+
 def _step_on_enqueued(player, vehInvID, cmdName):
 	try:
 		_enable_offline_battle_transition(player)
 		ctx = build_offline_battle_context(player, vehInvID, cmdName)
+		try:
+			_lan = _offh_lan()
+			if _lan is not None:
+				_lan.on_enqueued(ctx.get('mapID'), ctx.get('mapName'))
+		except Exception:
+			LOG_CURRENT_EXCEPTION()
 		player._offhangar_battle_ctx = ctx
 		player._offhangar_player_vehicle_id = ctx.get('playerVehicleID', vehInvID)
 		player._offhangar_team = 1

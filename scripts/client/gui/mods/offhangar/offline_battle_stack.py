@@ -171,6 +171,20 @@ def build_offline_battle_context(player, selected_veh_inv_id, cmdName=''):
 		
 		# Override if user selected a map via Demonstrator UI
 		sel_map_id = getattr(player, '_offhangar_selected_mapId', None)
+		# LAN guest: the host has already picked the map for this battle.
+		try:
+			import sys as _sys_lan
+			_lanmod = _sys_lan.modules.get('gui.mods.mod_lanlink')
+			_lan = _lanmod.get() if _lanmod is not None else None
+			if _lan is not None and _lan.role == 'guest':
+				_lan_map = _lan.take_forced_map()
+				if _lan_map is not None:
+					sel_map_id = _lan_map
+					if isinstance(sel_map_id, unicode):
+						sel_map_id = sel_map_id.encode('utf-8')
+					LOG_DEBUG('LAN: map from host', sel_map_id)
+		except Exception:
+			pass
 		# config 'force_map' does the same thing for testing, and hooks HERE
 		# rather than on the Fight button because the regular-battle path
 		# deliberately deletes _offhangar_selected_mapId - so setting that
