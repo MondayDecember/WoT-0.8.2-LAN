@@ -7094,6 +7094,16 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_sx, _sz, _syaw = _fs(getattr(player, '_offhangar_team', 1) or 1, 0)
 								else:
 									_sx, _sz, _syaw = _my_b.x, _my_b.z, 0.0
+								try:
+									# LAN guest: stand in the line-up slot the host gave us, not on
+									# top of the host in slot 0
+									_lan_sp = _offh_lan()
+									_gslot = _lan_sp.guest_slot() if _lan_sp is not None else None
+									if _gslot and _fs is not None:
+										_sx, _sz, _syaw = _fs(getattr(player, '_offhangar_team', 1) or 1, _gslot)
+										LOG_DEBUG('LAN: guest takes line-up slot', _gslot)
+								except Exception:
+									pass
 								# Roof-safe ground probe: while something substantially
 								# lower exists below the hit (roof/bridge), keep going down
 								_gy = None
@@ -10043,6 +10053,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				tm_local.setRotateYPR((turret_yaw[0], gun_pitch[0], 0))
 				turret_matrix_local.set(tm_local)
 
+				# LAN: tell the other players where our tank is (rate-limited inside)
+				try:
+					_lan_pose = _offh_lan()
+					if _lan_pose is not None and _lan_pose.in_lan_battle:
+						_lm = mock_veh.matrix
+						_lan_pose.send_pose(veh_pos, (_lm.yaw, _lm.pitch, _lm.roll), turret_yaw[0], gun_pitch[0], _veh_velocity[0])
+				except Exception:
+					pass
+
 				# --- PLAYER FIRE LOGIC ---
 				try:
 					_player_mock = mock_vehicles.get(getattr(player, 'playerVehicleID', -1))
@@ -10179,6 +10198,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					except Exception:
 						pass
 					if eid != _p_vid and getattr(m_veh, 'isAlive', False):
+						if getattr(m_veh, '_lan_remote', None):
+							try:
+								_lan_r = _offh_lan()
+								if _lan_r is not None:
+									_offh_lan_drive_remote(m_veh, _lan_r, dt, _tick_space)
+							except Exception:
+								pass
+							continue
 						try:
 							my_team = getattr(m_veh, '_bot_team', m_veh.publicInfo.get('team', 2) if getattr(m_veh, 'publicInfo', None) is not None else 2)
 							closest_dist = 99999.0
@@ -10220,6 +10247,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										m_veh._tgt_ref = 'P'
 								for oeid, omeh in mock_vehicles.iteritems():
 									if oeid == _p_vid: continue
+									if getattr(omeh, '_lan_remote', None): continue
 									if oeid != eid and getattr(omeh, 'isAlive', False):
 										oteam = getattr(omeh, '_bot_team', omeh.publicInfo.get('team', 2) if getattr(omeh, 'publicInfo', None) is not None else 2)
 										if my_team != oteam:
@@ -15536,6 +15564,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						
 						if not td: return True
 
+						# LAN: this slot is another player's tank, not a bot
+						_lan_remote_id = getattr(player, '_forced_spawn_remote', None)
+						_lan_remote_name = getattr(player, '_forced_spawn_remote_name', None)
+						if _lan_remote_id and _lan_remote_name:
+							bot_name = _lan_remote_name
+
 						# OOM guard: each bot is a full tank (models + textures +
 						# per-component VehicleStickers + recoil). Spawning far past a
 						# normal battle exhausts the 32-bit client and it crashes
@@ -15585,6 +15619,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_offh_set_alive(e_mock, True)
 							e_mock.isStarted = True
 							e_mock._bot_team = bot_team
+							e_mock._lan_remote = _lan_remote_id
 							LOG_DEBUG('SPAWN BOT: bot_team=%s bot_name=%s player_team=%s' % (bot_team, bot_name, getattr(player, '_offhangar_team', -99)))
 							e_mock.publicInfo = {
 								'vehicleType': td,
@@ -15992,7 +16027,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_lan = _offh_lan()
 						if _lan is not None and _lan.in_lan_battle:
 							if _lan.role == 'host':
-								_lan.host_set_plan(_jobs)
+								_own_x, _own_z, _own_yw = _formation_slot(_p_team, 0)
+								_own_veh = None
+								try: _own_veh = loaded_models['td'].type.name
+								except Exception: pass
+								_jobs = _lan.host_make_plan(_jobs, (_p_team, _own_x, _own_z, _own_yw, _own_veh))
+								LOG_DEBUG('LAN: host line-up, %d tanks to spawn' % len(_jobs))
 							elif _lan.role == 'guest':
 								_plan = _lan.guest_plan()
 								if _plan is None:
@@ -16013,7 +16053,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					def _spawn_next(_rest):
 						if _battle_finished[0] or not _rest:
 							return
-						_t, _x, _z, _yw, _vn = _rest[0]
+						_t, _x, _z, _yw, _vn = _rest[0][:5]
+						_lan_rid = _rest[0][5] if len(_rest[0]) > 5 else None
+						_lan_rname = _rest[0][6] if len(_rest[0]) > 6 else None
 						try:
 							_p2 = BigWorld.player()
 							# Bot ground height. Probe the BATTLE space (_offh_bspace); if it misses
@@ -16061,6 +16103,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_p2._forced_spawn_team = _t
 							_p2._forced_spawn_yaw = _yw
 							_p2._forced_spawn_vehname = _vn
+							_p2._forced_spawn_remote = _lan_rid
+							_p2._forced_spawn_remote_name = _lan_rname
 							try:
 								_mock_handleKeyEvent(_FakeSpawnEvent(Keys.KEY_P))
 							finally:
@@ -16068,6 +16112,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_p2._forced_spawn_team = None
 								_p2._forced_spawn_yaw = None
 								_p2._forced_spawn_vehname = None
+								_p2._forced_spawn_remote = None
+								_p2._forced_spawn_remote_name = None
 						except Exception as _se:
 							LOG_DEBUG('AUTO-SPAWN error:', str(_se))
 						BigWorld.callback(0.3, lambda: _spawn_next(_rest[1:]))
@@ -16727,6 +16773,85 @@ def _offh_lan():
 		return None
 
 
+def _offh_lan_vehname(compact_descr):
+	'''Full type name ('ussr:KV1') for a compact descr, as VehicleDescr(typeName=) wants it.'''
+	try:
+		from items import vehicles
+		if type(compact_descr) is int:
+			vd = vehicles.VehicleDescr(typeID=((compact_descr >> 4) & 15, compact_descr >> 8))
+		else:
+			vd = vehicles.VehicleDescr(compactDescr=compact_descr)
+		return vd.type.name
+	except Exception:
+		return None
+
+
+def _offh_angle_lerp(a, b, k):
+	import math
+	d = b - a
+	while d > math.pi: d -= 2 * math.pi
+	while d < -math.pi: d += 2 * math.pi
+	return a + d * k
+
+
+def _offh_lan_drive_remote(m_veh, lan, dt, space):
+	'''Drive a remote player's tank from the poses that player sends: no AI,
+	no physics - smooth toward the latest pose (LAN latency is a frame or two).'''
+	import BigWorld, Math, math
+	s = lan.remote_pose(m_veh._lan_remote)
+	if s is None:
+		if getattr(m_veh, '_fashion', None) is not None:
+			try: m_veh._fashion.movementInfo = Math.Vector4(0.0, 0.0, 0.0, 0.0)
+			except Exception: pass
+		return
+	px, py, pz = s['x']
+	ryaw, rpitch, rroll = s['r']
+	if not getattr(m_veh, '_lan_has_pose', False):
+		m_veh._lan_has_pose = True
+		k = 1.0
+	else:
+		k = min(1.0, dt * 12.0)
+	cur = m_veh.position
+	# a jump of more than 30 m is a respawn/teleport: snap instead of gliding
+	if (px - cur.x) ** 2 + (pz - cur.z) ** 2 > 900.0:
+		k = 1.0
+	m_veh.position = Math.Vector3(cur.x + (px - cur.x) * k, cur.y + (py - cur.y) * k, cur.z + (pz - cur.z) * k)
+	m_veh.yaw = _offh_angle_lerp(getattr(m_veh, 'yaw', 0.0) or 0.0, ryaw, k)
+	m_veh.pitch = _offh_angle_lerp(getattr(m_veh, 'pitch', 0.0) or 0.0, rpitch, k)
+	m_veh.roll = _offh_angle_lerp(getattr(m_veh, 'roll', 0.0) or 0.0, rroll, k)
+	m_veh.matrix.setRotateYPR((m_veh.yaw, m_veh.pitch, m_veh.roll))
+	m_veh.matrix.translation = m_veh.position
+	m_veh._veh_velocity = float(s.get('v', 0.0) or 0.0)
+	try:
+		if getattr(m_veh, 'bw_entity', None) is not None and getattr(m_veh.bw_entity, 'filter', None) is not None:
+			m_veh.bw_entity.filter.set(BigWorld.time(), space, m_veh.bw_entity.id, m_veh.position, (m_veh.matrix.roll, m_veh.matrix.pitch, m_veh.matrix.yaw), 0)
+	except Exception:
+		pass
+	if getattr(m_veh, '_chassis_model', None) is not None and not getattr(m_veh, '_servo_added', False):
+		try:
+			m_veh._chassis_model.addMotor(BigWorld.Servo(m_veh.matrix))
+			m_veh._servo_added = True
+		except Exception:
+			pass
+	try:
+		m_veh._turret_yaw = _offh_angle_lerp(getattr(m_veh, '_turret_yaw', 0.0) or 0.0, float(s.get('ty', 0.0)), k)
+		if getattr(m_veh, '_t_mat', None) is not None:
+			m_veh._t_mat.setRotateYPR((m_veh._turret_yaw, 0, 0))
+		_gp0 = getattr(m_veh, '_gun_pitch', 0.0) or 0.0
+		m_veh._gun_pitch = _gp0 + (float(s.get('gp', 0.0)) - _gp0) * k
+		if getattr(m_veh, '_g_mat', None) is not None:
+			m_veh._g_mat.setRotateYPR((0, m_veh._gun_pitch, 0))
+	except Exception:
+		pass
+	try:
+		_bfa = getattr(m_veh, '_fashion', None)
+		if _bfa is not None:
+			_v = max(-20.0, min(20.0, m_veh._veh_velocity))
+			_bfa.movementInfo = Math.Vector4(0.0, _v, _v, 0.0)
+	except Exception:
+		pass
+
+
 def _step_on_enqueued(player, vehInvID, cmdName):
 	try:
 		_enable_offline_battle_transition(player)
@@ -16734,7 +16859,7 @@ def _step_on_enqueued(player, vehInvID, cmdName):
 		try:
 			_lan = _offh_lan()
 			if _lan is not None:
-				_lan.on_enqueued(ctx.get('mapID'), ctx.get('mapName'))
+				_lan.on_enqueued(ctx.get('mapID'), ctx.get('mapName'), _offh_lan_vehname(ctx.get('selectedVehTypeCompDescr')))
 		except Exception:
 			LOG_CURRENT_EXCEPTION()
 		player._offhangar_battle_ctx = ctx

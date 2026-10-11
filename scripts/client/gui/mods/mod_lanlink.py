@@ -1,9 +1,11 @@
 # WoT 0.8.2 LAN - network link between a host and its guests.
 #
-# Step 1: transport (UDP, hello/welcome, ping).
-# Step 2.1: shared battle start. When the host presses "Battle", the map and
-# the bot line-up are sent to every guest; the guest's client starts the same
-# battle by itself and spawns the host's bots instead of rolling its own.
+# Step 1:   transport (UDP, hello/welcome, ping).
+# Step 2.1: shared battle start - map and bot line-up come from the host.
+# Step 2.2: players see each other. Each guest gets a line-up slot on the
+#           host's team; on every client the other players are spawned as
+#           "remote" tanks that are driven by the poses they send (20 Hz)
+#           instead of the bot AI.
 #
 # Status goes to python.log (lines starting with [LAN]) and to
 # offhangar_user/lanlink.txt.
@@ -12,7 +14,7 @@
 #   role     "host" or "guest" ("off" disables the mod)
 #   host_ip  address of the host (guest only)
 #   port     UDP port the host listens on
-#   name     nickname shown to the other side
+#   name     nickname shown to the other players
 #
 # Python 2.6 (the client's interpreter): no dict/set comprehensions,
 # str.format needs explicit indexes.
@@ -26,7 +28,7 @@ import zlib
 
 import BigWorld
 
-PROTO = 'WOTLAN2'
+PROTO = 'WOTLAN3'
 USER_DIR = 'offhangar_user'
 CFG_FILE = os.path.join(USER_DIR, 'lan.json')
 STATUS_FILE = os.path.join(USER_DIR, 'lanlink.txt')
@@ -45,6 +47,10 @@ RESEND_EVERY = 0.3     # reliable messages: resend interval
 RESEND_FOR = 10.0      # reliable messages: give up after
 COMPRESS_OVER = 900    # bytes of JSON above which a packet is zlib-compressed
 MAX_PACKET = 8000      # hard cap after compression
+POSE_EVERY = 0.05      # own tank pose: 20 per second
+POSE_STALE = 2.0       # a remote pose older than this is not applied
+
+HOST_ID = 'host'
 
 
 def _log(msg):
@@ -54,6 +60,13 @@ def _log(msg):
 		print '[LAN] %s' % msg
 	except Exception:
 		pass
+
+
+def _s(v):
+	'''JSON gives unicode; the client's APIs want byte strings.'''
+	if isinstance(v, unicode):
+		return v.encode('utf-8')
+	return v
 
 
 def _load_cfg():
@@ -80,6 +93,7 @@ def _load_cfg():
 		_log('config error %r, using defaults' % (e,))
 	cfg['role'] = str(cfg.get('role', 'host')).lower()
 	cfg['port'] = int(cfg.get('port', 27015))
+	cfg['name'] = _s(cfg.get('name', 'Player'))
 	return cfg
 
 
@@ -90,26 +104,36 @@ def _sock_code(e):
 		return None
 
 
+def _r(v, n=3):
+	return round(float(v), n)
+
+
 class Peer(object):
-	def __init__(self, addr, name):
+	def __init__(self, addr, name, pid):
 		self.addr = addr
 		self.name = name
+		self.pid = pid           # player id inside the session: 'host', 'g1', 'g2'...
 		self.last_seen = time.time()
 		self.rtt_ms = None
 		self.rtt_min = None
 		self.rtt_max = None
 		self.pings_sent = 0
 		self.pongs_got = 0
+		self.veh = None          # tank this peer took into the current battle
+		self.veh_bid = None
 
 
 class LanLink(object):
 	def __init__(self, cfg):
 		self.cfg = cfg
 		self.role = cfg['role']
-		self.name = cfg.get('name', 'Player')
+		self.name = cfg['name']
+		self.my_id = HOST_ID if self.role == 'host' else None
+		self.my_veh = None
 		self.sock = None
 		self.host_addr = None
 		self.peers = {}          # addr -> Peer
+		self.next_gid = 1
 		self.seq = 0
 		self.sent_at = {}        # ping seq -> send time
 		self.last_ping = 0.0
@@ -127,8 +151,15 @@ class LanLink(object):
 		self.pending_start = False
 		self.pending_start_at = 0.0
 		self.forced_map = None   # guest: map to use for the next battle
-		self.plan = None         # host: last line-up sent; guest: line-up received
+		self.plan = None         # full line-up of the current battle (wire form, 7-tuples)
 		self.plan_bid = None
+		self.my_spawn = None     # (x, z, yaw) of this player's slot, from the line-up
+		self.slots = {}          # pid -> line-up slot on the host's team (1, 2, ...)
+		# poses
+		self.last_pose_sent = 0.0
+		self.poses = {}          # pid -> (recv_time, msg)
+		self.poses_in = 0
+		self.poses_out = 0
 		self.last_event = ''
 
 	# --- socket ---------------------------------------------------------
@@ -204,6 +235,12 @@ class LanLink(object):
 		if peer is not None:
 			peer.last_seen = now
 
+		# Until the handshake is done only handshake traffic counts. A reliable
+		# message must not be acked by a client that cannot act on it yet, or
+		# the sender stops resending and the message is lost for good.
+		if peer is None and t not in ('hello', 'welcome', 'ping', 'pong', 'ack'):
+			return
+
 		# reliable: ack every copy, act on the first one only
 		rid = msg.get('rid')
 		if rid is not None and t != 'ack':
@@ -218,17 +255,19 @@ class LanLink(object):
 
 		elif t == 'hello' and self.role == 'host':
 			if peer is None:
-				peer = Peer(addr, msg.get('name', '?'))
+				peer = Peer(addr, _s(msg.get('name', '?')), 'g%d' % self.next_gid)
+				self.next_gid += 1
 				self.peers[addr] = peer
 				self.seen_rids.pop(addr, None)
-				_log('guest joined: %s from %s:%d' % (peer.name, addr[0], addr[1]))
-			self.send(addr, {'t': 'welcome', 'name': self.name})
+				_log('guest joined: %s (%s) from %s:%d' % (peer.name, peer.pid, addr[0], addr[1]))
+			self.send(addr, {'t': 'welcome', 'name': self.name, 'id': peer.pid})
 
 		elif t == 'welcome' and self.role == 'guest':
 			if peer is None:
-				peer = Peer(addr, msg.get('name', '?'))
+				peer = Peer(addr, _s(msg.get('name', '?')), HOST_ID)
 				self.peers[addr] = peer
-				_log('connected to host: %s at %s:%d' % (peer.name, addr[0], addr[1]))
+				self.my_id = _s(msg.get('id'))
+				_log('connected to host: %s at %s:%d, my id %s' % (peer.name, addr[0], addr[1], self.my_id))
 
 		elif t == 'ping':
 			self.send(addr, {'t': 'pong', 's': msg.get('s')})
@@ -251,20 +290,45 @@ class LanLink(object):
 		elif t == 'start' and self.role == 'guest' and peer is not None:
 			self.on_start(msg)
 
+		elif t == 'joined' and self.role == 'host' and peer is not None:
+			peer.veh = _s(msg.get('veh'))
+			peer.veh_bid = msg.get('bid')
+			self.last_event = '%s is in battle %s on %s' % (peer.name, peer.veh_bid, peer.veh)
+			_log(self.last_event)
+
 		elif t == 'plan' and self.role == 'guest' and peer is not None:
-			self.plan = self._jobs_from_wire(msg.get('jobs') or [])
-			self.plan_bid = msg.get('bid')
-			self.last_event = 'plan received: %d bots (battle %s)' % (len(self.plan), self.plan_bid)
+			self.set_plan(self._jobs_from_wire(msg.get('jobs') or []), msg.get('bid'))
+			self.last_event = 'plan received: %d tanks (battle %s), my slot %s' % (len(self.plan), self.plan_bid, self.my_spawn)
 			_log(self.last_event)
 
 		elif t == 'need_plan' and self.role == 'host' and peer is not None:
 			if self.plan is not None and msg.get('bid') == self.plan_bid:
 				self.send(addr, {'t': 'plan', 'bid': self.plan_bid, 'jobs': self._jobs_to_wire(self.plan)})
 
-	# --- battle sync: host side ------------------------------------------
+		elif t == 'pose' and peer is not None:
+			if msg.get('bid') != self.battle_id:
+				return
+			pid = _s(msg.get('id'))
+			if pid is None or pid == self.my_id:
+				return
+			prev = self.poses.get(pid)
+			if prev is not None and msg.get('n', 0) <= prev[1].get('n', 0) and prev[1].get('n', 0) - msg.get('n', 0) < 1000:
+				return   # out of order / duplicate
+			self.poses[pid] = (now, msg)
+			self.poses_in += 1
+			if self.role == 'host':
+				# relay a guest's pose to the other guests
+				for a, p in self.peers.items():
+					if a != addr:
+						self.send(a, dict(msg))
 
-	def on_enqueued(self, map_id, map_name):
+	# --- battle sync: start -------------------------------------------------
+
+	def on_enqueued(self, map_id, map_name, veh_name):
 		'''Called by offline_battle when this client starts a battle.'''
+		self.my_veh = veh_name
+		self.poses = {}
+		self.my_spawn = None
 		if self.role == 'host':
 			self.plan = None
 			self.plan_bid = None
@@ -274,8 +338,14 @@ class LanLink(object):
 				return
 			self.battle_id = '%d' % int(time.time() * 1000)
 			self.in_lan_battle = True
+			# line-up slots for the guests: slot 0 is the host, guests follow
+			self.slots = {}
+			pids = [p.pid for p in self.peers.values()]
+			pids.sort()
+			for i in range(len(pids)):
+				self.slots[pids[i]] = i + 1
 			self.broadcast_reliable({'t': 'start', 'bid': self.battle_id,
-			                         'map_id': map_id, 'map_name': map_name})
+			                         'map_id': map_id, 'map_name': map_name, 'slots': self.slots})
 			self.last_event = 'battle %s started on %s, sent to %d guest(s)' % (self.battle_id, map_name, len(self.peers))
 			_log(self.last_event)
 		else:
@@ -285,18 +355,9 @@ class LanLink(object):
 			if not self.in_lan_battle:
 				self.battle_id = None
 				_log('local battle (not started by host)')
-
-	def host_set_plan(self, jobs):
-		'''Host: the bot line-up for the current battle has been rolled.'''
-		if self.role != 'host' or not self.in_lan_battle:
-			return
-		self.plan = list(jobs)
-		self.plan_bid = self.battle_id
-		self.broadcast_reliable({'t': 'plan', 'bid': self.battle_id, 'jobs': self._jobs_to_wire(self.plan)})
-		self.last_event = 'plan sent: %d bots (battle %s)' % (len(self.plan), self.battle_id)
-		_log(self.last_event)
-
-	# --- battle sync: guest side ------------------------------------------
+				return
+			for addr in self.peers.keys():
+				self.send_reliable(addr, {'t': 'joined', 'bid': self.battle_id, 'veh': veh_name, 'name': self.name})
 
 	def on_start(self, msg):
 		bid = msg.get('bid')
@@ -306,6 +367,9 @@ class LanLink(object):
 		if self.plan_bid != bid:
 			self.plan = None
 			self.plan_bid = None
+		self.slots = {}
+		for k, v in (msg.get('slots') or {}).items():
+			self.slots[_s(k)] = int(v)
 		self.forced_map = msg.get('map_id')
 		if self.forced_map is None:
 			self.forced_map = msg.get('map_name')
@@ -336,32 +400,123 @@ class LanLink(object):
 		self.forced_map = None
 		return m
 
+	# --- battle sync: line-up ------------------------------------------------
+	#
+	# A line-up job is (team, x, z, yaw, vehicle, remote_id, display_name).
+	# remote_id None = an ordinary bot. Otherwise the tank belongs to a player
+	# and is driven by that player's poses on every other client.
+
+	def host_make_plan(self, jobs, own_job):
+		'''Host: the bots have just been rolled. Hand team slots to the guests
+		that are in this battle, add the host's own tank, send it all out and
+		return the jobs the host itself must spawn.'''
+		if self.role != 'host' or not self.in_lan_battle:
+			return list(jobs)
+		full = []
+		for j in jobs:
+			full.append((j[0], j[1], j[2], j[3], j[4], None, None))
+		team = own_job[0]
+		by_slot = {}
+		for p in self.peers.values():
+			if p.veh and p.veh_bid == self.battle_id and p.pid in self.slots:
+				by_slot[self.slots[p.pid]] = p
+		# the team's bot jobs fill slots 1, 2, ... in order (slot 0 is the host)
+		gi = 0
+		ti = 0
+		for i in range(len(full)):
+			j = full[i]
+			if j[0] != team:
+				continue
+			ti += 1
+			g = by_slot.get(ti)
+			if g is not None:
+				full[i] = (j[0], j[1], j[2], j[3], g.veh, g.pid, g.name)
+				gi += 1
+		if gi < len(by_slot):
+			_log('not enough team slots for all guests (%d of %d placed)' % (gi, len(by_slot)))
+		full.append((own_job[0], own_job[1], own_job[2], own_job[3], own_job[4], HOST_ID, self.name))
+		self.set_plan(full, self.battle_id)
+		self.broadcast_reliable({'t': 'plan', 'bid': self.battle_id, 'jobs': self._jobs_to_wire(full)})
+		self.last_event = 'plan sent: %d tanks, %d guest(s) placed (battle %s)' % (len(full), gi, self.battle_id)
+		_log(self.last_event)
+		return self.local_jobs()
+
+	def set_plan(self, full, bid):
+		self.plan = list(full)
+		self.plan_bid = bid
+		self.my_spawn = None
+		for j in self.plan:
+			if j[5] is not None and j[5] == self.my_id:
+				self.my_spawn = (j[1], j[2], j[3])
+
+	def local_jobs(self):
+		'''Jobs this client spawns: everything except its own tank.'''
+		out = []
+		for j in self.plan or []:
+			if j[5] is not None and j[5] == self.my_id:
+				continue
+			out.append(j)
+		return out
+
 	def guest_plan(self):
-		'''Guest: line-up for the current LAN battle, or None if not here yet.'''
+		'''Guest: jobs to spawn for the current LAN battle, or None if the
+		line-up has not arrived yet (asks the host again).'''
 		if self.role != 'guest' or not self.in_lan_battle:
 			return None
 		if self.plan is not None and self.plan_bid == self.battle_id:
-			return self.plan
-		if self.host_addr is not None:
-			for addr in self.peers.keys():
-				self.send(addr, {'t': 'need_plan', 'bid': self.battle_id})
+			return self.local_jobs()
+		for addr in self.peers.keys():
+			self.send(addr, {'t': 'need_plan', 'bid': self.battle_id})
 		return None
+
+	def guest_slot(self):
+		'''Guest: its line-up slot on the host's team, None outside a LAN battle.'''
+		if self.role != 'guest' or not self.in_lan_battle:
+			return None
+		return self.slots.get(self.my_id)
+
+	# --- poses ----------------------------------------------------------------
+
+	def send_pose(self, pos, ypr, turret_yaw, gun_pitch, speed):
+		if not self.in_lan_battle or self.my_id is None or not self.peers:
+			return
+		now = time.time()
+		if now - self.last_pose_sent < POSE_EVERY:
+			return
+		self.last_pose_sent = now
+		self.seq += 1
+		msg = {'t': 'pose', 'bid': self.battle_id, 'id': self.my_id, 'n': self.seq,
+		       'x': [_r(pos[0]), _r(pos[1]), _r(pos[2])],
+		       'r': [_r(ypr[0], 4), _r(ypr[1], 4), _r(ypr[2], 4)],
+		       'ty': _r(turret_yaw, 4), 'gp': _r(gun_pitch, 4), 'v': _r(speed, 2)}
+		for addr in self.peers.keys():
+			self.send(addr, dict(msg))
+		self.poses_out += 1
+
+	def remote_pose(self, pid):
+		'''Latest pose of a remote player, or None when none / too old.'''
+		entry = self.poses.get(pid)
+		if entry is None or time.time() - entry[0] > POSE_STALE:
+			return None
+		return entry[1]
 
 	# --- helpers ----------------------------------------------------------
 
 	def _jobs_to_wire(self, jobs):
 		out = []
 		for j in jobs:
-			out.append([j[0], j[1], j[2], j[3], j[4]])
+			out.append([j[0], j[1], j[2], j[3], j[4], j[5], j[6]])
 		return out
 
 	def _jobs_from_wire(self, jobs):
 		out = []
 		for j in jobs:
-			vn = j[4]
-			if isinstance(vn, unicode):
-				vn = vn.encode('utf-8')
-			out.append((int(j[0]), float(j[1]), float(j[2]), float(j[3]), vn))
+			rid = None
+			name = None
+			if len(j) > 6:
+				rid = _s(j[5])
+				name = _s(j[6])
+			out.append((int(j[0]), float(j[1]), float(j[2]), float(j[3]), _s(j[4]), rid, name))
 		return out
 
 	# --- main loop --------------------------------------------------------
@@ -420,7 +575,7 @@ class LanLink(object):
 			self.write_status()
 
 	def write_status(self):
-		lines = ['role: %s  name: %s  uptime: %ds' % (self.role, self.name, int(time.time() - self.started))]
+		lines = ['role: %s  name: %s  id: %s  uptime: %ds' % (self.role, self.name, self.my_id, int(time.time() - self.started))]
 		if self.role == 'guest':
 			lines.append('host: %s:%d' % self.host_addr)
 		if not self.peers:
@@ -430,8 +585,13 @@ class LanLink(object):
 			if p.pings_sent:
 				lost = 100.0 * (p.pings_sent - p.pongs_got) / p.pings_sent
 			rtt = '-' if p.rtt_ms is None else '%.1f ms (min %.1f, max %.1f)' % (p.rtt_ms, p.rtt_min, p.rtt_max)
-			lines.append('peer %s %s:%d  rtt %s  loss %.0f%%' % (p.name, addr[0], addr[1], rtt, lost))
-		lines.append('lan battle: %s  id: %s' % ('yes' if self.in_lan_battle else 'no', self.battle_id))
+			lines.append('peer %s [%s] %s:%d  rtt %s  loss %.0f%%' % (p.name, p.pid, addr[0], addr[1], rtt, lost))
+		lines.append('lan battle: %s  id: %s  my tank: %s  slots: %s' % (
+			'yes' if self.in_lan_battle else 'no', self.battle_id, self.my_veh, self.slots))
+		lines.append('poses: sent %d, received %d' % (self.poses_out, self.poses_in))
+		for pid in sorted(self.poses.keys()):
+			age = time.time() - self.poses[pid][0]
+			lines.append('  %s: last pose %.1fs ago at %s' % (pid, age, self.poses[pid][1].get('x')))
 		if self.last_event:
 			lines.append('last: %s' % self.last_event)
 		try:
