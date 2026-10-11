@@ -1110,6 +1110,92 @@ def _offh_spawn_spot(x, z, taken, bounds=None):
 	return (x, first[0], z)
 
 
+def _offh_brain():
+	"""The link to the bot brain (tools/bot_brain.py), or None when switched
+	off (config bot_brain). Created once per game session."""
+	_bl = globals().get('g_offh_brain')
+	if _bl is not None:
+		return _bl
+	if globals().get('g_offh_brain_tried'):
+		return None
+	globals()['g_offh_brain_tried'] = True
+	try:
+		from _constants import CONFIG_OPTIONS as _CFG
+		if not bool(_CFG.get('bot_brain', True)):
+			return None
+	except Exception:
+		pass
+	try:
+		import sys, os
+		_m = sys.modules.get('gui.mods.offhangar.brain_link')
+		if _m is None:
+			try:
+				from gui.mods.offhangar import brain_link as _m
+			except Exception:
+				_m = None
+		if _m is None:
+			# Not in the compiled loader's list: load it from source the same way.
+			import types
+			_p = os.path.join(os.path.dirname(__file__), 'brain_link.py')
+			_m = types.ModuleType('gui.mods.offhangar.brain_link')
+			_m.__file__ = _p
+			execfile(_p, _m.__dict__)
+			sys.modules['gui.mods.offhangar.brain_link'] = _m
+		globals()['g_offh_brain'] = _m.BrainLink()
+		LOG_DEBUG('BRAIN: link created')
+		return globals()['g_offh_brain']
+	except Exception:
+		import traceback
+		LOG_DEBUG('BRAIN: link failed:', traceback.format_exc())
+		return None
+
+
+def _offh_brain_tick(player):
+	"""Once a frame on a client whose bots think (host / solo): give the brain
+	this battle's map, measure ground around the bots, exchange messages."""
+	_bl = _offh_brain()
+	if _bl is None:
+		return
+	try:
+		import BigWorld, Math, os
+		from gui.mods.offhangar import paths as _P
+		_gen = globals().get('g_offh_battle_gen', 0)
+		if getattr(_bl, '_offh_gen', None) != _gen:
+			_ab = globals().get('g_offline_bounds')
+			if not _ab:
+				return
+			_bl._offh_gen = _gen
+			_mn = getattr(player.arena.arenaType, 'geometryName', '') or 'map'
+			_mn = str(_mn).replace('\\', '/').rstrip('/').split('/')[-1]
+			_bl.set_map(_mn, _ab, os.path.join(_P.USER_DIR, 'nav_dump', '%s.hc' % _mn))
+			LOG_DEBUG('BRAIN: map %s, %d cells known' % (_mn, _bl.cache.known))
+		_sp = _offh_bspace()
+
+		def _ground(x, z, top, bottom):
+			_c = BigWorld.wg_collideSegment(_sp, Math.Vector3(x, top, z), Math.Vector3(x, bottom, z), 128)
+			return _c[0].y if _c is not None else None
+
+		_pre = getattr(player.arena, 'period', 3) < 3
+		_bl.frame(_ground, _offh_water_depth, 120 if _pre else 50)
+		_now = BigWorld.time()
+		if _now - (globals().get('g_offh_brain_stat_t') or 0.0) > 5.0:
+			globals()['g_offh_brain_stat_t'] = _now
+			try:
+				_f = open(os.path.join(_P.USER_DIR, 'brain_link.txt'), 'w')
+				try:
+					_f.write(_bl.status() + '\n')
+				finally:
+					_f.close()
+			except Exception:
+				pass
+			if _now - (globals().get('g_offh_brain_save_t') or 0.0) > 30.0:
+				globals()['g_offh_brain_save_t'] = _now
+				_bl.save()
+	except Exception:
+		import traceback
+		LOG_DEBUG('BRAIN tick error:', traceback.format_exc())
+
+
 def _offh_hp_display(mock):
 	'''HP to SHOW for a mock, which is not always its .health.
 	
@@ -10337,6 +10423,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_offh_profile_tick()
 					# Nav grid: builds, dumps, then takes painted avoid areas.
 					_offh_nav_tick()
+					# Bot brain: feelers answered by tools/bot_brain.py (see brain_link.py)
+					_offh_brain_tick(player)
 				for eid, m_veh in mock_vehicles.iteritems():
 					# A tank at zero hit points must END UP DEAD, whatever route took it there:
 					# fire, drowning, HE splash, ramming, a fall, or a shell that landed while
@@ -10555,94 +10643,107 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								# keeps the heading it chose instead of losing its steering.
 								_ai_phases = globals().get('g_offh_ai_phases', 1) or 1
 								if _ai_phases <= 1 or (eid % _ai_phases) == globals().get('g_offh_ai_phase', 0):
-									_ray_angles = [0.0]
-									_step = 0.25
-									for i in range(1, 6): # up to 1.25 rad (~71 degrees)
-										if _mv_diff_yaw > 0:
-											_ray_angles.extend([i * _step, -i * _step])
-										else:
-											_ray_angles.extend([-i * _step, i * _step])
+									# Bot brain first: the same feelers, answered off the game thread from
+									# the measured height map. No usable answer -> cast the rays here.
+									_brain_ans = None
+									_brl = globals().get('g_offh_brain')
+									if _brl is not None and _brl.ready():
+										try:
+											_brl.ask(eid, m_veh.position.x, m_veh.position.y, m_veh.position.z, m_veh.yaw, 1 if _mv_diff_yaw > 0 else -1)
+											_brain_ans = _brl.take(eid)
+										except Exception:
+											_brain_ans = None
+									if _brain_ans is not None:
+										_feeler_steer_yaw = _brain_ans[1]
+									else:
+										_ray_angles = [0.0]
+										_step = 0.25
+										for i in range(1, 6): # up to 1.25 rad (~71 degrees)
+											if _mv_diff_yaw > 0:
+												_ray_angles.extend([i * _step, -i * _step])
+											else:
+												_ray_angles.extend([-i * _step, i * _step])
 									
-									# Two passes: first try a wide safe margin (2.2m), if boxed in, try a tighter margin (1.6m)
-									for _hw in (2.2, 1.6):
-										_center_blocked = False
-										_best_clear_angle = None
+										# Two passes: first try a wide safe margin (2.2m), if boxed in, try a tighter margin (1.6m)
+										for _hw in (2.2, 1.6):
+											_center_blocked = False
+											_best_clear_angle = None
 										
-										for _fyo in _ray_angles:
-											_fy = m_veh.yaw + _fyo
-											_hit = False
+											for _fyo in _ray_angles:
+												_fy = m_veh.yaw + _fyo
+												_hit = False
 											
-											# Width-aware sensors: Left track, Center, Right track
-											_cos_fy = math.cos(_fy)
-											_sin_fy = math.sin(_fy)
+												# Width-aware sensors: Left track, Center, Right track
+												_cos_fy = math.cos(_fy)
+												_sin_fy = math.sin(_fy)
 											
-											# Dual-height rays: catch low rocks (0.7m) and tall buildings (1.5m)
-											_ray_profiles = [(0.7, 7.0), (1.5, 12.0)]
+												# Dual-height rays: catch low rocks (0.7m) and tall buildings (1.5m)
+												_ray_profiles = [(0.7, 7.0), (1.5, 12.0)]
 											
-											for _h, _dist in _ray_profiles:
-												if _hit: break
+												for _h, _dist in _ray_profiles:
+													if _hit: break
 												
-												# 1. Terrain elevation check (Cliffs and High Hills)
-												_dest_x = m_veh.position.x + _sin_fy * _dist
-												_dest_z = m_veh.position.z + _cos_fy * _dist
-												_dest_y = m_veh.position.y
+													# 1. Terrain elevation check (Cliffs and High Hills)
+													_dest_x = m_veh.position.x + _sin_fy * _dist
+													_dest_z = m_veh.position.z + _cos_fy * _dist
+													_dest_y = m_veh.position.y
 												
-												try:
-													_g_hit = BigWorld.wg_collideSegment(_tick_space, 
-														Math.Vector3(_dest_x, m_veh.position.y + 4.0, _dest_z), 
-														Math.Vector3(_dest_x, m_veh.position.y - 15.0, _dest_z), 128)
-													if _g_hit:
-														_dest_y = _g_hit[0].y
-													else:
-														_hit = True # Abyss / out of bounds
-												except: pass
+													try:
+														_g_hit = BigWorld.wg_collideSegment(_tick_space, 
+															Math.Vector3(_dest_x, m_veh.position.y + 4.0, _dest_z), 
+															Math.Vector3(_dest_x, m_veh.position.y - 15.0, _dest_z), 128)
+														if _g_hit:
+															_dest_y = _g_hit[0].y
+														else:
+															_hit = True # Abyss / out of bounds
+													except: pass
 												
-												if _hit: break
+													if _hit: break
 												
-												_y_diff = _dest_y - m_veh.position.y
-												if _y_diff > _dist * 0.45 or _y_diff < -_dist * 0.7:
-													_hit = True
-													break
-												
-												# 1b. WATER. The probe above returns the LAKEBED, so a lake reads as
-												# perfectly flat, unobstructed, ideal terrain - which is exactly why
-												# bots have always been happy to drive into one and drown. One extra
-												# probe per ray, against the four this block already spends.
-												try:
-													if _offh_water_depth(_dest_x, _dest_y, _dest_z) > 0.8:
+													_y_diff = _dest_y - m_veh.position.y
+													if _y_diff > _dist * 0.45 or _y_diff < -_dist * 0.7:
 														_hit = True
 														break
-												except Exception: pass
-													
-												# 2. Obstacle check (parallel to slope)
-												for _ox in (-_hw, 0.0, _hw):
-													_sx = m_veh.position.x + _cos_fy * _ox
-													_sz = m_veh.position.z - _sin_fy * _ox
+												
+													# 1b. WATER. The probe above returns the LAKEBED, so a lake reads as
+													# perfectly flat, unobstructed, ideal terrain - which is exactly why
+													# bots have always been happy to drive into one and drown. One extra
+													# probe per ray, against the four this block already spends.
 													try:
-														_fs = Math.Vector3(_sx, m_veh.position.y + _h, _sz)
-														_fe = Math.Vector3(_sx + _sin_fy*_dist, _dest_y + _h, _sz + _cos_fy*_dist)
-														if BigWorld.wg_collideSegment(_tick_space, _fs, _fe, 128):
+														if _offh_water_depth(_dest_x, _dest_y, _dest_z) > 0.8:
 															_hit = True
 															break
-													except: pass
-											
-											if _fyo == 0.0:
-												if _hit: 
-													_center_blocked = True
-												else:
-													break # Center is clear
-											else:
-												if not _hit:
-													_best_clear_angle = _fyo
-													break
+													except Exception: pass
 													
-										if not _center_blocked:
-											break # Center is clear on this margin
-										if _best_clear_angle is not None:
-											_feeler_steer_yaw = m_veh.yaw + _best_clear_angle
-											break # Found a clear path
+													# 2. Obstacle check (parallel to slope)
+													for _ox in (-_hw, 0.0, _hw):
+														_sx = m_veh.position.x + _cos_fy * _ox
+														_sz = m_veh.position.z - _sin_fy * _ox
+														try:
+															_fs = Math.Vector3(_sx, m_veh.position.y + _h, _sz)
+															_fe = Math.Vector3(_sx + _sin_fy*_dist, _dest_y + _h, _sz + _cos_fy*_dist)
+															if BigWorld.wg_collideSegment(_tick_space, _fs, _fe, 128):
+																_hit = True
+																break
+														except: pass
 											
-									# If even tight margin fails, we just keep current steering and let stuck detector handle reversing if we crash
+												if _fyo == 0.0:
+													if _hit: 
+														_center_blocked = True
+													else:
+														break # Center is clear
+												else:
+													if not _hit:
+														_best_clear_angle = _fyo
+														break
+													
+											if not _center_blocked:
+												break # Center is clear on this margin
+											if _best_clear_angle is not None:
+												_feeler_steer_yaw = m_veh.yaw + _best_clear_angle
+												break # Found a clear path
+											
+										# If even tight margin fails, we just keep current steering and let stuck detector handle reversing if we crash
 								
 								# Hysteresis: keep steering into the clear path for a moment
 								if _feeler_steer_yaw is not None:

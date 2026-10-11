@@ -57,6 +57,7 @@ try {
 
         Copy-Item (Join-Path $src 'tools\WoT-LAN-Launcher.ps1') $d -Force
         Copy-Item (Join-Path $src 'tools\WoT LAN.cmd') $d -Force
+        Copy-Item (Join-Path $src 'tools\bot_brain.py') $d -Force
         Write-Host "$d : updated (old .pyc removed: $removed)" -ForegroundColor Green
     }
 } finally {

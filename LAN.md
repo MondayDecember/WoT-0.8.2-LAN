@@ -45,6 +45,29 @@ puts the launcher next to `WorldOfTanks.exe`. `offhangar_user` is untouched.
 - The hangar header shows the launcher nickname unless `config.json` sets its
   own `nickname`.
 
+## Bot brain (feelers off the game thread)
+
+`tools/bot_brain.py` (Python 3, standard library) answers the bots' obstacle
+feelers - the most expensive part of a bot - on its own CPU core. The
+launcher copies nothing itself; `update_mod.ps1` puts `bot_brain.py` next to
+`WorldOfTanks.exe`, and **Играть** starts it (host / solo; a guest's bots
+follow the host). Needs Python 3 on that PC
+(`winget install Python.Python.3.12`).
+
+- The game measures ground height on a 2 m grid only around bots, once per
+  map, saved in `offhangar_user/nav_dump/<map>.hc`, and streams new cells to
+  the brain over UDP 127.0.0.1:27017.
+- Per bot decision the game sends position, yaw and wanted turn; the brain
+  runs the same tests as the in-game rays (0.7 m / 7 m and 1.5 m / 12 m,
+  left / centre / right track, slope, water) against the height map and
+  answers a steering yaw, "clear", or "not measured yet" - then the bot casts
+  its own rays as before.
+- No brain or `"bot_brain": false` in config.json: exactly the old behaviour.
+- Status: `offhangar_user/brain_link.txt` (game side: asked / used /
+  fallback / cells measured) and `brain_status.txt` (brain: answers per
+  second, CPU use); the launcher shows both.
+- `python bot_brain.py --selftest` checks the feeler logic.
+
 ## Measuring where the frame goes
 
 `"profile": true` in `offhangar_user/lan.json` (solo or LAN). 45 s into the

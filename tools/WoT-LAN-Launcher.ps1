@@ -68,6 +68,31 @@ function Set-BotsPerTeam([int]$n) {
     } catch { }
 }
 
+# ------------------------------------------------------------------ bot brain (bot_brain.py, Python 3)
+$brainScript = Join-Path $GameDir 'bot_brain.py'
+$script:brainNote = ''
+function Find-Python3 {
+    # Returns @(exe, extraArgs) of a working Python 3, or $null. The Windows
+    # Store alias 'python.exe' exists even without Python, so ask for real.
+    foreach ($c in @(@('py', @('-3')), @('python', @()), @('python3', @()))) {
+        $cmd = Get-Command $c[0] -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $cmd) { continue }
+        try { $v = & $cmd.Source @($c[1] + @('-c', 'import sys;print(sys.version_info[0])')) 2>$null } catch { $v = $null }
+        if ("$v".Trim() -eq '3') { return ,@($cmd.Source, $c[1]) }
+    }
+    return $null
+}
+function Start-Brain {
+    if (-not (Test-Path $brainScript)) { $script:brainNote = 'Мозг ботов: нет bot_brain.py рядом с игрой - боты считаются в игре.'; return }
+    $py = Find-Python3
+    if (-not $py) { $script:brainNote = 'Мозг ботов: не найден Python 3 - боты считаются в игре (как раньше).'; return }
+    $args2 = @($py[1]) + @("`"$brainScript`"", '--dir', "`"$GameDir`"")
+    try {
+        Start-Process -FilePath $py[0] -ArgumentList $args2 -WindowStyle Hidden | Out-Null
+        $script:brainNote = 'Мозг ботов: запущен (' + $py[0] + ')'
+    } catch { $script:brainNote = 'Мозг ботов: не запустился - ' + $_.Exception.Message }
+}
+
 # ------------------------------------------------------------------ lobby client
 $script:udp = $null
 $script:lobbyEp = $null
@@ -332,8 +357,9 @@ $btnPlay.Add_Click({
     if (Get-Process WorldOfTanks -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe }) {
         Msg 'Игра уже запущена. Настройки сохранены, они применятся при следующем запуске.'; return
     }
+    if ($role -ne 'guest') { Start-Brain }     # a guest's bots follow the host: no brain needed
     Start-Process $exe -WorkingDirectory $GameDir
-    $status.Text = "Запуск... ($role)"
+    $status.Text = "Запуск... ($role)`r`n" + $script:brainNote
 })
 
 # ---------------- tab: friends
@@ -490,12 +516,22 @@ $timer.Add_Tick({
             if ($tabs.SelectedTab -eq $tFr) { Refresh-Friends } elseif ($tabs.SelectedTab -eq $tPl) { Refresh-Platoon }
         }
     }
-    if ($tabs.SelectedTab -eq $tPlay -and (Test-Path $statPath)) {
+    if ($tabs.SelectedTab -eq $tPlay) {
         try {
-            $age = ((Get-Date) - (Get-Item $statPath).LastWriteTime).TotalSeconds
-            $txt = Get-Content $statPath -Raw -Encoding UTF8
-            if ($age -gt 10) { $txt = "(игра не запущена или не отвечает)`r`n" + $txt }
-            $status.Text = $txt -replace "`r?`n", "`r`n"
+            $txt = ''
+            if (Test-Path $statPath) {
+                $age = ((Get-Date) - (Get-Item $statPath).LastWriteTime).TotalSeconds
+                $txt = Get-Content $statPath -Raw -Encoding UTF8
+                if ($age -gt 10) { $txt = "(игра не запущена или не отвечает)`r`n" + $txt }
+            }
+            if ($script:brainNote) { $txt += "`r`n" + $script:brainNote }
+            foreach ($bf in @('brain_status.txt', 'brain_link.txt')) {
+                $bp = Join-Path $userDir $bf
+                if ((Test-Path $bp) -and ((Get-Date) - (Get-Item $bp).LastWriteTime).TotalSeconds -lt 30) {
+                    $txt += "`r`n" + (Get-Content $bp -Raw -Encoding UTF8).Trim()
+                }
+            }
+            if ($txt) { $status.Text = $txt -replace "`r?`n", "`r`n" }
         } catch {}
     }
 })
