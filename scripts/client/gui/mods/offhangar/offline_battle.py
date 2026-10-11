@@ -10059,7 +10059,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_lan_pose = _offh_lan()
 					if _lan_pose is not None and _lan_pose.in_lan_battle:
 						_lm = mock_veh.matrix
-						_lan_pose.send_pose(veh_pos, (_lm.yaw, _lm.pitch, _lm.roll), turret_yaw[0], gun_pitch[0], _veh_velocity[0])
+						_lan_pose.send_pose(veh_pos, (_lm.yaw, _lm.pitch, _lm.roll), turret_yaw[0], gun_pitch[0], _veh_velocity[0], getattr(mock_veh, 'health', None))
 				except Exception:
 					pass
 
@@ -10177,6 +10177,32 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_lan_guest_bots = (_lan_t is not None and _lan_t.role == 'guest' and _lan_t.in_lan_battle
 				                   and _lan_t.cfg.get('guest_follow_bots', True))
 				_lan_loop_t0 = time.time() if _lan_t is not None else 0.0
+				if _lan_t is not None and _lan_t.in_lan_battle:
+					try:
+						for _lan_shm in _lan_t.take_shots():
+							_offh_lan_play_shot(_lan_shm, mock_vehicles, _lan_t)
+						if _lan_t.role == 'host':
+							for _lan_deid, _lan_dmg, _lan_dpid in _lan_t.take_damage():
+								_lan_dm = mock_vehicles.get(_lan_deid)
+								if _lan_dm is None or not getattr(_lan_dm, 'isAlive', False) or (getattr(_lan_dm, 'health', 0) or 0) <= 0:
+									continue
+								_lan_shooter = _lan_t.remote_eids.get(_lan_dpid, -1)
+								_lan_act = min(int(_lan_dmg), int(getattr(_lan_dm, 'health', 0) or 0))
+								try:
+									from gui.mods.offhangar import battle_ledger as _BLED_L
+									_BLED_L.get().note_hit(_lan_shooter, _lan_deid, damage=_lan_act, pierced=_lan_act > 0, he=False)
+								except Exception:
+									pass
+								_lan_dm.health -= int(_lan_dmg)
+								_lan_dm.last_killer_id = _lan_shooter
+								_offh_sync_marker_health(_lan_dm, _p_vid)
+						else:
+							_lan_own = _lan_t.player_state(_lan_t.my_id)
+							_lan_pm = mock_vehicles.get(_p_vid)
+							if _lan_own is not None and _lan_pm is not None:
+								_offh_lan_apply_own_hp(player, _lan_pm, _lan_own, _lan_t, _p_vid)
+					except Exception:
+						pass
 				# Bot navigation only matters where the bot AI runs: a LAN guest's bots
 				# follow the host, so it skips routes, profiles and the nav grid.
 				if not _lan_guest_bots:
@@ -10209,7 +10235,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						if getattr(m_veh, '_lan_remote', None):
 							try:
 								if _lan_t is not None:
-									_offh_lan_drive_remote(m_veh, _lan_t, dt, _tick_space)
+									_offh_lan_drive_remote(m_veh, _lan_t, dt, _tick_space, _p_vid)
 							except Exception:
 								pass
 							continue
@@ -10261,7 +10287,6 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										m_veh._tgt_ref = 'P'
 								for oeid, omeh in mock_vehicles.iteritems():
 									if oeid == _p_vid: continue
-									if getattr(omeh, '_lan_remote', None): continue
 									if oeid != eid and getattr(omeh, 'isAlive', False):
 										oteam = getattr(omeh, '_bot_team', omeh.publicInfo.get('team', 2) if getattr(omeh, 'publicInfo', None) is not None else 2)
 										if my_team != oteam:
@@ -11563,6 +11588,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											if hit_veh is not None and veh_hit_dist < world_hit_dist and g_projectile_mover and _b_impact_pos is not None:
 												try: g_projectile_mover.hide(_b_sid, _b_impact_pos)
 												except Exception: pass
+											try:
+												if _lan_t is not None and _lan_t.role == 'host' and _lan_t.in_lan_battle:
+													_lan_t.send_shot(eid, 0, start_p, _vel, _b_impact_pos if (hit_veh is not None and veh_hit_dist < world_hit_dist) else None)
+											except Exception:
+												pass
 											
 											# A bot's damage lands when ITS shell does, same as the player's. Every name
 											# below is bound as a DEFAULT ARG rather than closed over: this runs inside
@@ -12014,7 +12044,20 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if _lbeid == _p_vid or getattr(_lbm, '_lan_remote', None):
 								continue
 							_lan_bs.append(_offh_lan_bot_state(_lbeid, _lbm, _p_vid))
-						_lan_t.send_bots(_lan_bs)
+						_lan_pl = {}
+						for _lbeid, _lbm in mock_vehicles.iteritems():
+							if _lbeid == _p_vid:
+								_lpid = 'host'
+							else:
+								_lpid = getattr(_lbm, '_lan_remote', None)
+								if not _lpid:
+									continue
+							_lhp = int(getattr(_lbm, 'health', 0) or 0)
+							_lk = getattr(_lbm, 'last_killer_id', -1)
+							if _lk is None: _lk = -1
+							if _lk == _p_vid: _lk = 'host'
+							_lan_pl[_lpid] = [_lhp, 1 if (_lhp > 0 and getattr(_lbm, 'isAlive', True)) else 0, _lk]
+						_lan_t.send_bots(_lan_bs, _lan_pl)
 				except Exception:
 					pass
 
@@ -14428,6 +14471,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							g_projectile_mover.hide(_sid, _impact_pos)
 						except Exception as _hde:
 							LOG_DEBUG('tracer hide err:', str(_hde))
+					# LAN: the others see this shot (flash, tracer to the impact)
+					try:
+						_lan_s = _offh_lan()
+						_lan_vel = locals().get('_vel')
+						if _lan_s is not None and _lan_s.in_lan_battle and _sid is not None and _lan_vel is not None:
+							_lan_s.send_shot(_lan_s.my_id, locals().get('_si', 0), start_pos, _lan_vel,
+								locals().get('_impact_pos') if enemy_mock is not None else None)
+					except Exception:
+						pass
 
 					# Damage lands when the SHELL DOES. The whole resolution used to run the instant
 					# the trigger was pulled, so hit points, crits and the kill were applied about a
@@ -14644,6 +14696,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 
 								actual_dmg = min(dmg, max(0, enemy_mock.health))
 								enemy_mock.health -= dmg
+								# LAN guest: the bot really lives on the host - tell it
+								try:
+									_lan_g = _offh_lan()
+									if _lan_g is not None and _lan_g.role == 'guest' and _lan_g.in_lan_battle and not getattr(enemy_mock, '_lan_remote', None):
+										_lan_g.send_damage(enemy_mock.id, dmg)
+										enemy_mock._lan_hp_hold = (int(enemy_mock.health), time.time())
+								except Exception:
+									pass
 								enemy_mock.damage_from_player = (getattr(enemy_mock, 'damage_from_player', 0) or 0) + actual_dmg
 								enemy_mock.hits_from_player = (getattr(enemy_mock, 'hits_from_player', 0) or 0) + 1
 								LOG_DEBUG('HIT! Damage:', dmg, 'Enemy HP:', enemy_mock.health)
@@ -16934,9 +16994,16 @@ def _offh_lan_tracks(m_veh, v):
 		pass
 
 
-def _offh_lan_drive_remote(m_veh, lan, dt, space):
-	"""Remote player tank: pose from that player's own client."""
+def _offh_lan_drive_remote(m_veh, lan, dt, space, p_vid=-1):
+	"""Remote player tank: pose from that player's own client, hit points
+	from the host (on a guest) or from the owner's pose (on the host)."""
+	if lan.role == 'guest':
+		_pst = lan.player_state(m_veh._lan_remote)
+		if _pst is not None:
+			_offh_lan_sync_hp(m_veh, _pst[0], _pst[1], _pst[2] if len(_pst) > 2 else None, lan, p_vid)
 	s = lan.remote_pose(m_veh._lan_remote)
+	if s is not None and lan.role == 'host' and s.get('hp') is not None:
+		_offh_lan_sync_hp(m_veh, s.get('hp'), int(s.get('hp')) > 0, None, lan, p_vid)
 	if s is None:
 		_offh_lan_tracks(m_veh, 0.0)
 		return
@@ -16944,6 +17011,111 @@ def _offh_lan_drive_remote(m_veh, lan, dt, space):
 	r = s['r']
 	_offh_lan_apply_pose(m_veh, x[0], x[1], x[2], r[0], r[1], r[2],
 	                     s.get('ty', 0.0), s.get('gp', 0.0), s.get('v', 0.0), dt, space)
+
+
+def _offh_lan_sync_hp(m_veh, hp, alive, killer, lan, p_vid):
+	"""A remote player's tank: hit points (and death) from the authority -
+	the host's snapshot on a guest, the owner's pose on the host. Only ever
+	lowers the hit points; the zero-hp sweep at the top of the bot loop then
+	runs the normal kill path."""
+	try:
+		cur = int(getattr(m_veh, 'health', 0) or 0)
+		hp = 0 if not alive else int(hp)
+		if hp >= cur:
+			return
+		if killer is not None:
+			m_veh.last_killer_id = lan.local_killer(killer, p_vid)
+		m_veh.health = hp
+		_offh_sync_marker_health(m_veh, p_vid)
+	except Exception:
+		pass
+
+
+def _offh_lan_apply_own_hp(player, player_mock, st, lan, p_vid):
+	"""Guest: our own tank's hit points come from the host - the bots that
+	shoot us live there. Only lowers: damage we took locally (a fall, a ram)
+	stands and goes back to the host in our pose."""
+	try:
+		hp = 0 if not st[1] else int(st[0])
+		cur = int(getattr(player_mock, 'health', 0) or 0)
+		if hp >= cur:
+			return
+		if len(st) > 2:
+			player_mock.last_killer_id = lan.local_killer(st[2], p_vid)
+		player_mock.health = hp
+		try:
+			if getattr(player, 'vehicle', None):
+				player.vehicle.health = hp
+		except Exception:
+			pass
+		try:
+			from gui import WindowsManager as _WMh
+			_bwh = _WMh.g_windowsManager.battleWindow
+			if hasattr(_bwh, 'damagePanel'):
+				_bwh.damagePanel.updateHealth(hp)
+		except Exception:
+			pass
+		try:
+			_offh_hit_sound('/hits/hits_n_impacts/tank_hit_armor_crit')
+		except Exception:
+			pass
+		_offh_lan_dbg('own tank hit: %d -> %d (killer %s)' % (cur, hp, getattr(player_mock, 'last_killer_id', None)))
+	except Exception:
+		pass
+
+
+def _offh_lan_play_shot(msg, mocks, lan):
+	"""Play a shot fired on another client: muzzle flash, recoil and the
+	tracer up to where it struck. Damage is not decided here."""
+	try:
+		import BigWorld, Math, random
+		from items import vehicles
+		shooter = msg.get('s')
+		if isinstance(shooter, (int, long)):
+			eid = int(shooter)
+		else:
+			eid = lan.remote_eids.get(_offh_lan_str(shooter))
+		m = mocks.get(eid) if eid is not None else None
+		if m is None or not getattr(m, 'isAlive', False):
+			return
+		td = getattr(m, 'typeDescriptor', None)
+		shots = td.gun.get('shots', []) if td is not None else []
+		if not shots:
+			return
+		shot = shots[max(0, min(int(msg.get('i', 0) or 0), len(shots) - 1))]
+		a = msg.get('a') or [0, 0, 0]
+		v = msg.get('v') or [0, 0, 0]
+		start = Math.Vector3(a[0], a[1], a[2])
+		vel = Math.Vector3(v[0], v[1], v[2])
+		if g_projectile_mover:
+			eff = vehicles.g_cache.shotEffects[shot['shell']['effectsIndex']]
+			sid = random.randint(100000, 999999)
+			cam_pos = BigWorld.camera().position if BigWorld.camera() else start
+			globals()['g_offh_adding_projectile'] = True
+			try:
+				g_projectile_mover.add(sid, eff, shot['gravity'], start, vel, start, False, cam_pos)
+			finally:
+				globals()['g_offh_adding_projectile'] = False
+			try:
+				_pj = getattr(g_projectile_mover, '_ProjectileMover__projectiles', {}).get(sid)
+				if _pj is not None: _pj['fireMissedTrigger'] = False
+			except Exception:
+				pass
+			e = msg.get('e')
+			if e:
+				try: g_projectile_mover.hide(sid, Math.Vector3(e[0], e[1], e[2]))
+				except Exception: pass
+		_trigger_gun_recoil(getattr(m, '_gun_recoil', None))
+		if not _play_muzzle_flash(m, getattr(m, '_gun_model', None), td, is_player=False):
+			_fallback_gun_sound(td, getattr(m, '_chassis_model', None))
+	except Exception as _pse:
+		_offh_lan_dbg('play shot error: %r' % (_pse,))
+
+
+def _offh_lan_str(v):
+	if isinstance(v, unicode):
+		return v.encode('utf-8')
+	return v
 
 
 def _offh_lan_set_spotted(m_veh, visible, p_vid):
@@ -17019,6 +17191,13 @@ def _offh_lan_drive_bot(m_veh, st, dt, space, p_vid, p_team, lan=None):
 		m_veh._lan_seen_t = _tm.time()
 	_offh_lan_apply_pose(m_veh, st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], dt, space)
 	hp = st[11]
+	_hold = getattr(m_veh, '_lan_hp_hold', None)
+	if _hold is not None:
+		# we hit this bot a moment ago; the host has not reported it yet
+		if hp <= _hold[0] or time.time() - _hold[1] > 1.5:
+			m_veh._lan_hp_hold = None
+		else:
+			hp = _hold[0]
 	if hp != getattr(m_veh, 'health', hp):
 		m_veh.health = hp
 		_offh_sync_marker_health(m_veh, p_vid)

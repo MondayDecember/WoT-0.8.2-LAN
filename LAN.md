@@ -10,8 +10,8 @@ Goal: several players in one offline battle, one PC acting as the host.
 | 1 | UDP transport, host/guest handshake, ping | done |
 | 2.1 | Host starts a battle, guests start the same map with the same bot line-up | done |
 | 2.2 | Players see each other's tanks (position, hull, turret, gun) | done |
-| 2.3 | Guest bots follow the host's simulation | testing |
-| 3 | Shooting, damage, deaths decided by the host | todo |
+| 2.3 | Guest bots follow the host's simulation | done (verify on two PCs) |
+| 3 | Shooting, damage, deaths decided by the host | testing |
 | 4 | Play over the internet (WireGuard / port forward) | todo |
 
 ## Setup
@@ -64,8 +64,29 @@ Entity ids are 1000 + the job's index in the shared line-up on every client.
 Killer ids are translated: the host's own tank travels as `host`, a player's
 tank as its line-up id (which on that player's client is the player vehicle).
 
-Not synced yet: shots and their effects (bots do not fire on a guest's
-screen), damage dealt by guests, base capture.
+## Shooting
+
+- Every shot fired on any client (a bot on the host, or a player) goes out
+  as a `shot` event: shooter, shell index, muzzle position, velocity and the
+  point where it struck a tank. The others play the muzzle flash, the recoil
+  and the tracer up to that point. The host relays guests' shots.
+- Bots on the host target guests' tanks like any other tank. The damage those
+  shots do is computed on the host, against the guest's tank there.
+- Every bot snapshot also carries each player's hit points, alive flag and
+  killer (`pl`). A guest takes its own hit points from there (only ever
+  downward) and dies through its normal death path; remote players' tanks
+  follow the same numbers.
+- A guest's own shell is resolved on the guest (it sees the same bots in the
+  same places). When it damages a bot, the amount goes to the host (`dmg`,
+  reliable) and the host applies it to the real bot, credited to that guest's
+  tank. The guest keeps its lowered hit points for up to 1.5 s until the
+  host's snapshot catches up.
+- Damage a player takes locally (falls, rams) travels in its pose (`hp`) and
+  lowers its tank on the host.
+
+Not synced yet: module/crew crits and fires on a guest's own tank (only hit
+points), hit sparks at the target on other clients, base capture, the
+post-battle results screen.
 
 ## Two clients on one PC
 

@@ -193,6 +193,14 @@ class LanLink(object):
 		self.bots_time = 0.0
 		self.bots_in = 0
 		self.bots_out = 0
+		self.players = {}        # guest: pid -> [hp, alive, killer] from the host's snapshot
+		# shooting
+		self.shots_in = []       # shot events to play on this client
+		self.damage_in = []      # host: (eid, dmg, pid) hits reported by guests
+		self.shots_sent = 0
+		self.shots_got = 0
+		self.dmg_sent = 0
+		self.dmg_got = 0
 		self.last_event = ''
 		# frame watch
 		self.last_tick = 0.0
@@ -367,6 +375,37 @@ class LanLink(object):
 					self.bots[int(st[0])] = st
 				except Exception:
 					pass
+			pl = msg.get('pl') or {}
+			for k in pl:
+				self.players[_s(k)] = pl[k]
+
+		elif t == 'shot' and peer is not None:
+			if msg.get('bid') != self.battle_id:
+				return
+			shooter = msg.get('s')
+			if isinstance(shooter, unicode):
+				shooter = _s(shooter)
+			if shooter == self.my_id:
+				return
+			self.shots_in.append(msg)
+			self.shots_got += 1
+			if len(self.shots_in) > 200:
+				del self.shots_in[:100]
+			if self.role == 'host':
+				# relay a guest's shot to the other guests
+				for a in self.peers.keys():
+					if a != addr:
+						self.send(a, dict(msg))
+
+		elif t == 'dmg' and self.role == 'host' and peer is not None:
+			if msg.get('bid') != self.battle_id:
+				return
+			try:
+				self.damage_in.append((int(msg.get('eid')), int(msg.get('d', 0)), peer.pid))
+				self.dmg_got += 1
+				dbg('%s hit tank %s for %s' % (peer.pid, msg.get('eid'), msg.get('d')))
+			except Exception:
+				pass
 
 		elif t == 'pose' and peer is not None:
 			if msg.get('bid') != self.battle_id:
@@ -393,6 +432,9 @@ class LanLink(object):
 		self.poses = {}
 		self.bots = {}
 		self.bots_n = 0
+		self.players = {}
+		self.shots_in = []
+		self.damage_in = []
 		self.my_spawn = None
 		if self.role == 'host':
 			self.plan = None
@@ -554,7 +596,7 @@ class LanLink(object):
 
 	# --- poses ----------------------------------------------------------------
 
-	def send_pose(self, pos, ypr, turret_yaw, gun_pitch, speed):
+	def send_pose(self, pos, ypr, turret_yaw, gun_pitch, speed, hp=None):
 		if not self.in_lan_battle or self.my_id is None or not self.peers:
 			return
 		now = time.time()
@@ -566,6 +608,8 @@ class LanLink(object):
 		       'x': [_r(pos[0]), _r(pos[1]), _r(pos[2])],
 		       'r': [_r(ypr[0], 4), _r(ypr[1], 4), _r(ypr[2], 4)],
 		       'ty': _r(turret_yaw, 4), 'gp': _r(gun_pitch, 4), 'v': _r(speed, 2)}
+		if hp is not None:
+			msg['hp'] = int(hp)
 		for addr in self.peers.keys():
 			self.send(addr, dict(msg))
 		self.poses_out += 1
@@ -587,10 +631,11 @@ class LanLink(object):
 		self.last_bots_sent = now
 		return True
 
-	def send_bots(self, states):
-		'''Host: one snapshot of all bots (compressed when large).'''
+	def send_bots(self, states, players=None):
+		'''Host: one snapshot of all bots plus every player's hit points
+		(compressed when large).'''
 		self.seq += 1
-		msg = {'t': 'bots', 'bid': self.battle_id, 'n': self.seq, 'b': states}
+		msg = {'t': 'bots', 'bid': self.battle_id, 'n': self.seq, 'b': states, 'pl': players or {}}
 		for addr in self.peers.keys():
 			self.send(addr, dict(msg))
 		self.bots_out += 1
@@ -608,6 +653,43 @@ class LanLink(object):
 		if self.my_index is not None and killer == 1000 + self.my_index:
 			return my_vid
 		return killer
+
+	def player_state(self, pid):
+		'''Guest: [hp, alive, killer] of a player as the host sees it.'''
+		if time.time() - self.bots_time > POSE_STALE:
+			return None
+		return self.players.get(pid)
+
+	def send_shot(self, shooter, shot_index, start, vel, impact):
+		'''A shot was fired on this client: shooter is a bot entity id (host
+		only) or a player id. Everyone else plays it; damage is not in here.'''
+		if not self.in_lan_battle or not self.peers:
+			return
+		msg = {'t': 'shot', 'bid': self.battle_id, 's': shooter, 'i': int(shot_index or 0),
+		       'a': [_r(start[0], 2), _r(start[1], 2), _r(start[2], 2)],
+		       'v': [_r(vel[0], 2), _r(vel[1], 2), _r(vel[2], 2)],
+		       'e': None if impact is None else [_r(impact[0], 2), _r(impact[1], 2), _r(impact[2], 2)]}
+		for addr in self.peers.keys():
+			self.send(addr, dict(msg))
+		self.shots_sent += 1
+
+	def take_shots(self):
+		out = self.shots_in
+		self.shots_in = []
+		return out
+
+	def send_damage(self, eid, dmg):
+		'''Guest: our shell did dmg to tank eid - the host applies it.'''
+		if self.role != 'guest' or not self.in_lan_battle:
+			return
+		for addr in self.peers.keys():
+			self.send_reliable(addr, {'t': 'dmg', 'bid': self.battle_id, 'eid': int(eid), 'd': int(dmg)})
+		self.dmg_sent += 1
+
+	def take_damage(self):
+		out = self.damage_in
+		self.damage_in = []
+		return out
 
 	def bot_state(self, eid):
 		'''Guest: the host's latest state of a bot, None if unknown or stale.'''
@@ -733,6 +815,8 @@ class LanLink(object):
 			'yes' if self.in_lan_battle else 'no', self.battle_id, self.my_veh, self.slots))
 		lines.append('poses: sent %d, received %d' % (self.poses_out, self.poses_in))
 		lines.append('bot snapshots: sent %d, received %d, bots known %d' % (self.bots_out, self.bots_in, len(self.bots)))
+		lines.append('shots: sent %d, received %d; hits: sent %d, received %d; players %s' % (
+			self.shots_sent, self.shots_got, self.dmg_sent, self.dmg_got, self.players))
 		for pid in sorted(self.poses.keys()):
 			age = time.time() - self.poses[pid][0]
 			lines.append('  %s: last pose %.1fs ago at %s' % (pid, age, self.poses[pid][1].get('x')))
