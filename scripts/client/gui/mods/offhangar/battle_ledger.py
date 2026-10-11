@@ -238,6 +238,45 @@ class BattleLedger(object):
 			len(self._spotted_by))
 
 
+	# --- LAN: the host's record replaces a guest's at the end of a battle ---
+
+	def export(self):
+		'''Plain lists/ints only (JSON-safe): the host sends this to guests so
+		their results screen shows what really happened, not just their own
+		shots.'''
+		pairs = []
+		for key, detail in self._pairs.iteritems():
+			pairs.append([key[0], key[1]] + [detail.get(f, 0) for f in DETAIL_FIELDS])
+		return {
+			'pairs': pairs,
+			'shots': [[k, v] for k, v in self._shots.iteritems()],
+			'killed': [[k, v[0], v[1]] for k, v in self._killed_by.iteritems()],
+			'spotted': [[k, v] for k, v in self._spotted_by.iteritems()],
+			'mileage': [[k, v] for k, v in self._mileage.iteritems()],
+			'capture': [[k, v[0], v[1]] for k, v in self._capture.iteritems()],
+		}
+
+	def load_from(self, data, idmap):
+		'''Replace this record with an exported one, every vehicle id passed
+		through idmap(id) (the host's ids are not all the guest's ids).'''
+		self.reset()
+		for row in data.get('pairs') or []:
+			d = _new_detail()
+			for i in range(len(DETAIL_FIELDS)):
+				d[DETAIL_FIELDS[i]] = int(row[2 + i])
+			self._pairs[(idmap(row[0]), idmap(row[1]))] = d
+		for k, v in data.get('shots') or []:
+			self._shots[idmap(k)] = int(v)
+		for k, killer, reason in data.get('killed') or []:
+			self._killed_by[idmap(k)] = (idmap(killer) if killer else 0, reason)
+		for k, v in data.get('spotted') or []:
+			self._spotted_by[idmap(k)] = idmap(v)
+		for k, v in data.get('mileage') or []:
+			self._mileage[idmap(k)] = float(v)
+		for k, g, d in data.get('capture') or []:
+			self._capture[idmap(k)] = [int(g), int(d)]
+
+
 _ledger = [None]
 
 

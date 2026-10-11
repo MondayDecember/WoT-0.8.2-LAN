@@ -529,8 +529,8 @@ class LanLink(object):
 
 		elif t == 'end' and self.role == 'guest' and peer is not None:
 			if msg.get('bid') == self.battle_id:
-				self.end_msg = (int(msg.get('w', 0)), _s(msg.get('why', '')))
-				self.last_event = 'host ended the battle: winner %s (%s)' % self.end_msg
+				self.end_msg = (int(msg.get('w', 0)), _s(msg.get('why', '')), msg.get('lg'), msg.get('hv'))
+				self.last_event = 'host ended the battle: winner %s (%s)' % self.end_msg[:2]
 				_log(self.last_event)
 				dbg(self.last_event)
 
@@ -957,11 +957,16 @@ class LanLink(object):
 			self.send_reliable(addr, {'t': 'dmg', 'bid': self.battle_id, 'eid': int(eid), 'd': int(dmg)})
 		self.dmg_sent += 1
 
-	def send_end(self, winner, reason):
-		'''Host: the battle is over - same outcome for everyone.'''
+	def send_end(self, winner, reason, ledger=None, my_vid=None):
+		'''Host: the battle is over - same outcome for everyone, plus the
+		host's battle record for the guests' results screens.'''
 		if self.role != 'host' or not self.in_lan_battle:
 			return
-		self.broadcast_reliable({'t': 'end', 'bid': self.battle_id, 'w': int(winner), 'why': reason})
+		msg = {'t': 'end', 'bid': self.battle_id, 'w': int(winner), 'why': reason}
+		if ledger is not None:
+			msg['lg'] = ledger
+			msg['hv'] = my_vid
+		self.broadcast_reliable(msg)
 		dbg('battle end sent: winner %s (%s)' % (winner, reason))
 
 	def take_end(self):
@@ -1028,6 +1033,23 @@ class LanLink(object):
 		out = list(self.capture_changed.items())
 		self.capture_changed = {}
 		return out
+
+	def host_id_map(self, host_vid, my_vid):
+		'''Guest: maps a vehicle id from the host's record to ours.'''
+		host_eid = self.remote_eids.get(HOST_ID, -1)
+		mine = (1000 + self.my_index) if self.my_index is not None else None
+
+		def idmap(x):
+			try:
+				x = int(x)
+			except Exception:
+				return x
+			if host_vid is not None and x == int(host_vid):
+				return host_eid
+			if mine is not None and x == mine:
+				return my_vid
+			return x
+		return idmap
 
 	def take_damage(self):
 		out = self.damage_in

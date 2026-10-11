@@ -6669,7 +6669,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			try:
 				_lan_e = _offh_lan()
 				if _lan_e is not None and _lan_e.role == 'host' and _lan_e.in_lan_battle:
-					_lan_e.send_end(winner, reason)
+					_lan_e.send_end(winner, reason, _offh_lan_ledger_export(), getattr(BigWorld.player(), 'playerVehicleID', None))
 					_offh_lan_book_stats(_lan_e, winner)
 			except Exception:
 				pass
@@ -6976,7 +6976,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						try:
 							_lan_c = _offh_lan()
 							if _lan_c is not None and _lan_c.role == 'host' and _lan_c.in_lan_battle:
-								_lan_c.send_end(3 - base_team, 'base captured')
+								_lan_c.send_end(3 - base_team, 'base captured', _offh_lan_ledger_export(), getattr(player, 'playerVehicleID', None))
 								_offh_lan_book_stats(_lan_c, 3 - base_team)
 						except Exception:
 							pass
@@ -10223,6 +10223,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_lan_end = _lan_t.take_end()
 							if _lan_end is not None:
 								_offh_lan_dbg('battle end from host: winner %s (%s)' % (_lan_end[0], _lan_end[1]))
+								if _lan_end[2]:
+									# the results screen is built from the ledger: take the host's
+									try:
+										from gui.mods.offhangar import battle_ledger as _BL_E
+										_BL_E.get().load_from(_lan_end[2], _lan_t.host_id_map(_lan_end[3], _p_vid))
+										_offh_lan_dbg('battle record from host loaded: %s' % _BL_E.get().summary() if hasattr(_BL_E.get(), 'summary') else 'battle record from host loaded')
+									except Exception as _lle:
+										_offh_lan_dbg('battle record from host failed: %r' % (_lle,))
 								_offh_finish_battle(_lan_end[0], 'host: %s' % _lan_end[1])
 							for _lan_ct, _lan_cv in _lan_t.take_capture_changes():
 								try:
@@ -17316,6 +17324,15 @@ def _offh_lan_quick_keys():
 
 
 _OFFH_LAN_QUICK = _offh_lan_quick_keys()
+
+
+def _offh_lan_ledger_export():
+	try:
+		from gui.mods.offhangar import battle_ledger as _BL_X
+		return _BL_X.get().export()
+	except Exception as e:
+		_offh_lan_dbg('ledger export failed: %r' % (e,))
+		return None
 
 
 def _offh_lan_guest_follows():
