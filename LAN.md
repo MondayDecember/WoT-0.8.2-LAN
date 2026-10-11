@@ -9,8 +9,8 @@ Goal: several players in one offline battle, one PC acting as the host.
 |------|------|-------|
 | 1 | UDP transport, host/guest handshake, ping | done |
 | 2.1 | Host starts a battle, guests start the same map with the same bot line-up | done |
-| 2.2 | Players see each other's tanks (position, hull, turret, gun) | testing |
-| 2.3 | Guest bots follow the host's simulation | todo |
+| 2.2 | Players see each other's tanks (position, hull, turret, gun) | done |
+| 2.3 | Guest bots follow the host's simulation | testing |
 | 3 | Shooting, damage, deaths decided by the host | todo |
 | 4 | Play over the internet (WireGuard / port forward) | todo |
 
@@ -51,8 +51,21 @@ A guest that presses Battle on its own gets an ordinary local battle.
   turret yaw, gun pitch, speed - 20 per second). The host relays guest poses to
   the other guests.
 
-Not synced yet: shots, damage, deaths, and the bots' own movement (each client
-still runs its own bot AI).
+## Shared bots
+
+Bots are simulated on the host only. About 15 times a second the host sends
+every bot's state (position, hull, turret, gun, speed, hit points, alive,
+spotted by the team, killer). On a guest the bot AI, routes and nav grid are
+switched off; bots follow those states. A bot the host reports dead goes to
+0 HP and the guest's normal kill path makes the wreck. Enemy visibility on the
+guest follows the host's team spotting.
+
+Entity ids are 1000 + the job's index in the shared line-up on every client.
+Killer ids are translated: the host's own tank travels as `host`, a player's
+tank as its line-up id (which on that player's client is the player vehicle).
+
+Not synced yet: shots and their effects (bots do not fire on a guest's
+screen), damage dealt by guests, base capture.
 
 ## Two clients on one PC
 

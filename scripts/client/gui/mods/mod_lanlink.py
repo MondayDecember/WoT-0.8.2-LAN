@@ -49,6 +49,7 @@ COMPRESS_OVER = 900    # bytes of JSON above which a packet is zlib-compressed
 MAX_PACKET = 8000      # hard cap after compression
 POSE_EVERY = 0.05      # own tank pose: 20 per second
 POSE_STALE = 2.0       # a remote pose older than this is not applied
+BOTS_EVERY = 1.0 / 15  # host: bot states to the guests, 15 per second
 
 HOST_ID = 'host'
 
@@ -154,12 +155,21 @@ class LanLink(object):
 		self.plan = None         # full line-up of the current battle (wire form, 7-tuples)
 		self.plan_bid = None
 		self.my_spawn = None     # (x, z, yaw) of this player's slot, from the line-up
+		self.my_index = None     # this player's job index in the line-up (entity id 1000+index elsewhere)
+		self.remote_eids = {}    # pid -> entity id of that player's tank on THIS client
 		self.slots = {}          # pid -> line-up slot on the host's team (1, 2, ...)
 		# poses
 		self.last_pose_sent = 0.0
 		self.poses = {}          # pid -> (recv_time, msg)
 		self.poses_in = 0
 		self.poses_out = 0
+		# bots (host: last send; guest: last snapshot from the host)
+		self.last_bots_sent = 0.0
+		self.bots = {}           # eid -> state list
+		self.bots_n = 0
+		self.bots_time = 0.0
+		self.bots_in = 0
+		self.bots_out = 0
 		self.last_event = ''
 
 	# --- socket ---------------------------------------------------------
@@ -305,6 +315,21 @@ class LanLink(object):
 			if self.plan is not None and msg.get('bid') == self.plan_bid:
 				self.send(addr, {'t': 'plan', 'bid': self.plan_bid, 'jobs': self._jobs_to_wire(self.plan)})
 
+		elif t == 'bots' and self.role == 'guest' and peer is not None:
+			if msg.get('bid') != self.battle_id:
+				return
+			n = msg.get('n', 0)
+			if n <= self.bots_n and self.bots_n - n < 100000:
+				return   # older than what we have
+			self.bots_n = n
+			self.bots_time = now
+			self.bots_in += 1
+			for st in msg.get('b') or []:
+				try:
+					self.bots[int(st[0])] = st
+				except Exception:
+					pass
+
 		elif t == 'pose' and peer is not None:
 			if msg.get('bid') != self.battle_id:
 				return
@@ -328,6 +353,8 @@ class LanLink(object):
 		'''Called by offline_battle when this client starts a battle.'''
 		self.my_veh = veh_name
 		self.poses = {}
+		self.bots = {}
+		self.bots_n = 0
 		self.my_spawn = None
 		if self.role == 'host':
 			self.plan = None
@@ -445,9 +472,15 @@ class LanLink(object):
 		self.plan = list(full)
 		self.plan_bid = bid
 		self.my_spawn = None
-		for j in self.plan:
+		self.my_index = None
+		self.remote_eids = {}
+		for i in range(len(self.plan)):
+			j = self.plan[i]
 			if j[5] is not None and j[5] == self.my_id:
 				self.my_spawn = (j[1], j[2], j[3])
+				self.my_index = i
+			elif j[5] is not None:
+				self.remote_eids[j[5]] = 1000 + i
 
 	def local_jobs(self):
 		'''Jobs this client spawns: everything except its own tank. Each job
@@ -497,6 +530,44 @@ class LanLink(object):
 		for addr in self.peers.keys():
 			self.send(addr, dict(msg))
 		self.poses_out += 1
+
+	def bots_due(self):
+		'''Host: time to send the next bot snapshot?'''
+		if not self.peers:
+			return False
+		now = time.time()
+		if now - self.last_bots_sent < BOTS_EVERY:
+			return False
+		self.last_bots_sent = now
+		return True
+
+	def send_bots(self, states):
+		'''Host: one snapshot of all bots (compressed when large).'''
+		self.seq += 1
+		msg = {'t': 'bots', 'bid': self.battle_id, 'n': self.seq, 'b': states}
+		for addr in self.peers.keys():
+			self.send(addr, dict(msg))
+		self.bots_out += 1
+
+	def local_killer(self, killer, my_vid):
+		'''Turn a killer id from another client into this client's id: the
+		host's own tank travels as 'host', a player's tank as 1000+index -
+		which on that player's own client is the player vehicle.'''
+		if killer == HOST_ID or killer == u'host':
+			return self.remote_eids.get(HOST_ID, -1)
+		try:
+			killer = int(killer)
+		except Exception:
+			return -1
+		if self.my_index is not None and killer == 1000 + self.my_index:
+			return my_vid
+		return killer
+
+	def bot_state(self, eid):
+		'''Guest: the host's latest state of a bot, None if unknown or stale.'''
+		if time.time() - self.bots_time > POSE_STALE:
+			return None
+		return self.bots.get(eid)
 
 	def remote_pose(self, pid):
 		'''Latest pose of a remote player, or None when none / too old.'''
@@ -594,6 +665,7 @@ class LanLink(object):
 		lines.append('lan battle: %s  id: %s  my tank: %s  slots: %s' % (
 			'yes' if self.in_lan_battle else 'no', self.battle_id, self.my_veh, self.slots))
 		lines.append('poses: sent %d, received %d' % (self.poses_out, self.poses_in))
+		lines.append('bot snapshots: sent %d, received %d, bots known %d' % (self.bots_out, self.bots_in, len(self.bots)))
 		for pid in sorted(self.poses.keys()):
 			age = time.time() - self.poses[pid][0]
 			lines.append('  %s: last pose %.1fs ago at %s' % (pid, age, self.poses[pid][1].get('x')))

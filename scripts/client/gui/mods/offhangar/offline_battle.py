@@ -10172,11 +10172,16 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# Baked per-map destinations: loads once, then validates a slice of
 				# nodes per frame against the LIVE 0.8.2 terrain. No-op on maps we
 				# have not baked.
-				_offh_route_tick()
-				# Painted profile: per-team/per-class points, routes, avoid areas.
-				_offh_profile_tick()
-				# Nav grid: builds, dumps, then takes painted avoid areas.
-				_offh_nav_tick()
+				_lan_t = _offh_lan()
+				_lan_guest_bots = _lan_t is not None and _lan_t.role == 'guest' and _lan_t.in_lan_battle
+				# Bot navigation only matters where the bot AI runs: a LAN guest's bots
+				# follow the host, so it skips routes, profiles and the nav grid.
+				if not _lan_guest_bots:
+					_offh_route_tick()
+					# Painted profile: per-team/per-class points, routes, avoid areas.
+					_offh_profile_tick()
+					# Nav grid: builds, dumps, then takes painted avoid areas.
+					_offh_nav_tick()
 				for eid, m_veh in mock_vehicles.iteritems():
 					# A tank at zero hit points must END UP DEAD, whatever route took it there:
 					# fire, drowning, HE splash, ramming, a fall, or a shell that landed while
@@ -10200,9 +10205,15 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					if eid != _p_vid and getattr(m_veh, 'isAlive', False):
 						if getattr(m_veh, '_lan_remote', None):
 							try:
-								_lan_r = _offh_lan()
-								if _lan_r is not None:
-									_offh_lan_drive_remote(m_veh, _lan_r, dt, _tick_space)
+								if _lan_t is not None:
+									_offh_lan_drive_remote(m_veh, _lan_t, dt, _tick_space)
+							except Exception:
+								pass
+							continue
+						if _lan_guest_bots:
+							# LAN guest: the host runs the bot AI; this bot only follows it
+							try:
+								_offh_lan_drive_bot(m_veh, _lan_t.bot_state(eid), dt, _tick_space, _p_vid, _p_team, _lan_t)
 							except Exception:
 								pass
 							continue
@@ -11988,6 +11999,18 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							import traceback
 							LOG_DEBUG('Bot AI Exception:', traceback.format_exc())
 							
+				# LAN host: publish every bot's state to the guests (~15 per second)
+				try:
+					if _lan_t is not None and _lan_t.role == 'host' and _lan_t.in_lan_battle and _lan_t.bots_due():
+						_lan_bs = []
+						for _lbeid, _lbm in mock_vehicles.iteritems():
+							if _lbeid == _p_vid or getattr(_lbm, '_lan_remote', None):
+								continue
+							_lan_bs.append(_offh_lan_bot_state(_lbeid, _lbm, _p_vid))
+						_lan_t.send_bots(_lan_bs)
+				except Exception:
+					pass
+
 				# PLAYER DEATH CHECK
 				try:
 					player_mock = mock_vehicles.get(getattr(player, 'playerVehicleID', -1))
@@ -16807,18 +16830,11 @@ def _offh_angle_lerp(a, b, k):
 	return a + d * k
 
 
-def _offh_lan_drive_remote(m_veh, lan, dt, space):
-	'''Drive a remote player's tank from the poses that player sends: no AI,
-	no physics - smooth toward the latest pose (LAN latency is a frame or two).'''
-	import BigWorld, Math, math
-	s = lan.remote_pose(m_veh._lan_remote)
-	if s is None:
-		if getattr(m_veh, '_fashion', None) is not None:
-			try: m_veh._fashion.movementInfo = Math.Vector4(0.0, 0.0, 0.0, 0.0)
-			except Exception: pass
-		return
-	px, py, pz = s['x']
-	ryaw, rpitch, rroll = s['r']
+def _offh_lan_apply_pose(m_veh, px, py, pz, ryaw, rpitch, rroll, ty, gp, v, dt, space):
+	"""Put a network-driven tank (remote player or, on a guest, any bot) where
+	its owner says it is: no AI, no physics - smooth toward the latest pose
+	(LAN latency is a frame or two)."""
+	import BigWorld, Math
 	if not getattr(m_veh, '_lan_has_pose', False):
 		m_veh._lan_has_pose = True
 		k = 1.0
@@ -16834,7 +16850,7 @@ def _offh_lan_drive_remote(m_veh, lan, dt, space):
 	m_veh.roll = _offh_angle_lerp(getattr(m_veh, 'roll', 0.0) or 0.0, rroll, k)
 	m_veh.matrix.setRotateYPR((m_veh.yaw, m_veh.pitch, m_veh.roll))
 	m_veh.matrix.translation = m_veh.position
-	m_veh._veh_velocity = float(s.get('v', 0.0) or 0.0)
+	m_veh._veh_velocity = float(v or 0.0)
 	try:
 		if getattr(m_veh, 'bw_entity', None) is not None and getattr(m_veh.bw_entity, 'filter', None) is not None:
 			m_veh.bw_entity.filter.set(BigWorld.time(), space, m_veh.bw_entity.id, m_veh.position, (m_veh.matrix.roll, m_veh.matrix.pitch, m_veh.matrix.yaw), 0)
@@ -16847,22 +16863,121 @@ def _offh_lan_drive_remote(m_veh, lan, dt, space):
 		except Exception:
 			pass
 	try:
-		m_veh._turret_yaw = _offh_angle_lerp(getattr(m_veh, '_turret_yaw', 0.0) or 0.0, float(s.get('ty', 0.0)), k)
+		m_veh._turret_yaw = _offh_angle_lerp(getattr(m_veh, '_turret_yaw', 0.0) or 0.0, float(ty), k)
 		if getattr(m_veh, '_t_mat', None) is not None:
 			m_veh._t_mat.setRotateYPR((m_veh._turret_yaw, 0, 0))
 		_gp0 = getattr(m_veh, '_gun_pitch', 0.0) or 0.0
-		m_veh._gun_pitch = _gp0 + (float(s.get('gp', 0.0)) - _gp0) * k
+		m_veh._gun_pitch = _gp0 + (float(gp) - _gp0) * k
 		if getattr(m_veh, '_g_mat', None) is not None:
 			m_veh._g_mat.setRotateYPR((0, m_veh._gun_pitch, 0))
 	except Exception:
 		pass
+	_offh_lan_tracks(m_veh, m_veh._veh_velocity)
+
+
+def _offh_lan_tracks(m_veh, v):
 	try:
+		import Math
 		_bfa = getattr(m_veh, '_fashion', None)
 		if _bfa is not None:
-			_v = max(-20.0, min(20.0, m_veh._veh_velocity))
+			_v = max(-20.0, min(20.0, float(v or 0.0)))
 			_bfa.movementInfo = Math.Vector4(0.0, _v, _v, 0.0)
 	except Exception:
 		pass
+
+
+def _offh_lan_drive_remote(m_veh, lan, dt, space):
+	"""Remote player tank: pose from that player's own client."""
+	s = lan.remote_pose(m_veh._lan_remote)
+	if s is None:
+		_offh_lan_tracks(m_veh, 0.0)
+		return
+	x = s['x']
+	r = s['r']
+	_offh_lan_apply_pose(m_veh, x[0], x[1], x[2], r[0], r[1], r[2],
+	                     s.get('ty', 0.0), s.get('gp', 0.0), s.get('v', 0.0), dt, space)
+
+
+def _offh_lan_set_spotted(m_veh, visible, p_vid):
+	"""Guest: show/hide an enemy bot and its marker the way the host's spotting
+	decided (the host's spotting is team spotting, guests included)."""
+	try:
+		import BigWorld
+		if visible:
+			m_veh._spot_until = BigWorld.time() + 1.0
+		now_vis = bool(visible) and (getattr(m_veh, 'health', 0) or 0) > 0
+		if now_vis == getattr(m_veh, '_spot_visible', True) and getattr(m_veh, '_lan_spot_applied', False):
+			return
+		m_veh._lan_spot_applied = True
+		m_veh._spot_visible = now_vis
+		ch = getattr(m_veh, '_chassis_model', None)
+		if ch is not None:
+			try:
+				ch.visible = now_vis
+				ch.visibleAttachments = now_vis
+			except Exception:
+				pass
+		from gui import WindowsManager as _WMl
+		_bwl = getattr(_WMl.g_windowsManager, 'battleWindow', None)
+		_vml = getattr(_bwl, 'vMarkersManager', None) if _bwl is not None else None
+		if _vml is not None:
+			mk = getattr(m_veh, 'marker', None)
+			if now_vis and mk in (None, -1) and getattr(m_veh, 'proxy', None) is not None:
+				m_veh.marker = _vml.createMarker(m_veh.proxy)
+				_offh_sync_marker_health(m_veh, p_vid)
+			elif (not now_vis) and mk not in (None, -1):
+				try: _vml.destroyMarker(mk)
+				except Exception: pass
+				m_veh.marker = None
+	except Exception:
+		pass
+
+
+def _offh_lan_drive_bot(m_veh, st, dt, space, p_vid, p_team, lan=None):
+	"""Guest: a bot follows the host's simulation. st is the host's state:
+	[id, alive, x, y, z, yaw, pitch, roll, turret, gun, speed, hp, spotted, killer]
+	or [id, 0, killer] for a dead one."""
+	if st is None:
+		_offh_lan_tracks(m_veh, 0.0)
+		return
+	if not st[1]:
+		# dead on the host: hit points to zero, the zero-hp sweep at the top of
+		# the bot loop then runs the normal kill path (wreck, kill feed, panel)
+		_k = st[2] if len(st) > 2 else -1
+		if lan is not None:
+			_k = lan.local_killer(_k, p_vid)
+		m_veh.last_killer_id = _k
+		m_veh.health = 0
+		_offh_lan_tracks(m_veh, 0.0)
+		return
+	_offh_lan_apply_pose(m_veh, st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], dt, space)
+	hp = st[11]
+	if hp != getattr(m_veh, 'health', hp):
+		m_veh.health = hp
+		_offh_sync_marker_health(m_veh, p_vid)
+	if getattr(m_veh, '_bot_team', 2) != (p_team or 1):
+		_offh_lan_set_spotted(m_veh, st[12], p_vid)
+
+
+def _offh_lan_bot_state(eid, m_veh, p_vid):
+	"""Host: compact state of one bot for the guests."""
+	if not getattr(m_veh, 'isAlive', False) or (getattr(m_veh, 'health', 0) or 0) <= 0:
+		_k = getattr(m_veh, 'last_killer_id', -1)
+		if _k is None:
+			_k = -1
+		if _k == p_vid:
+			_k = 'host'   # our own tank has another id on the guests
+		return [eid, 0, _k]
+	import BigWorld
+	p = m_veh.position
+	mt = m_veh.matrix
+	sv = 1
+	if getattr(m_veh, '_bot_team', 2) == 2:
+		sv = 1 if BigWorld.time() < (getattr(m_veh, '_spot_until', 0.0) or 0.0) else 0
+	return [eid, 1, round(p.x, 2), round(p.y, 2), round(p.z, 2),
+	        round(mt.yaw, 3), round(mt.pitch, 3), round(mt.roll, 3),
+	        round(getattr(m_veh, '_turret_yaw', 0.0) or 0.0, 3), round(getattr(m_veh, '_gun_pitch', 0.0) or 0.0, 3),
+	        round(getattr(m_veh, '_veh_velocity', 0.0) or 0.0, 1), int(getattr(m_veh, 'health', 0) or 0), sv]
 
 
 def _step_on_enqueued(player, vehInvID, cmdName):
