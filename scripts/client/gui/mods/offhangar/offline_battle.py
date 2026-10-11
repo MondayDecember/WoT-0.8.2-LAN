@@ -15130,6 +15130,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			def _mock_handleKeyEvent(event):
 				import BigWorld, Keys, Math
 				player = BigWorld.player()
+				# LAN quick messages to the other players: F5 / F6 / F7
+				try:
+					if event.isKeyDown() and not event.isRepeatedEvent():
+						_lan_q = _offh_lan()
+						if _lan_q is not None and _lan_q.in_lan_battle:
+							_qtext = _OFFH_LAN_QUICK.get(event.key)
+							if _qtext is not None:
+								_lan_q.send_chat(_qtext)
+								return True
+				except Exception:
+					pass
 				# X-ray overlay first, and only when it was actually armed by config.
 				# It claims F8/F9/F10 and returns True for those, so nothing else in
 				# this handler sees them; every other key falls straight through.
@@ -17290,6 +17301,21 @@ def _offh_lan_book_stats(lan, winner):
 		lan.record_battle(rows, winner)
 	except Exception as e:
 		_offh_lan_dbg('stats booking failed: %r' % (e,))
+
+
+def _offh_lan_quick_keys():
+	try:
+		import Keys
+		return {
+			Keys.KEY_F5: u'\u0410\u0442\u0430\u043a\u0443\u044e!',                       # Атакую!
+			Keys.KEY_F6: u'\u041d\u0443\u0436\u043d\u0430 \u043f\u043e\u043c\u043e\u0449\u044c!',  # Нужна помощь!
+			Keys.KEY_F7: u'\u041e\u0442\u0441\u0442\u0443\u043f\u0430\u0435\u043c!',            # Отступаем!
+		}
+	except Exception:
+		return {}
+
+
+_OFFH_LAN_QUICK = _offh_lan_quick_keys()
 
 
 def _offh_lan_guest_follows():

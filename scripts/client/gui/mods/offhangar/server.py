@@ -26,6 +26,25 @@ class FakeServer(object):
 			return FakeServer(name='%s.%s' % (self.__name, name), isMuted=self.__isMuted)
 
 	def chatCommandFromClient(self, requestID, action, channelID, int64Arg, int16Arg, stringArg1, stringArg2):
+		# LAN: a chat line typed in the client goes to the other players. Which
+		# action carries a typed message is checked against chat_shared, and
+		# every command is noted in lan_debug.log so the mapping can be checked.
+		try:
+			import sys
+			_lm = sys.modules.get('gui.mods.mod_lanlink')
+			_lan = _lm.get() if _lm is not None else None
+			if _lan is not None:
+				_lm.dbg('chat command action=%s channel=%s s1=%r s2=%r' % (action, channelID, stringArg1, stringArg2))
+				_bcast = None
+				try:
+					from chat_shared import CHAT_ACTIONS
+					_bcast = CHAT_ACTIONS.broadcast.index()
+				except Exception:
+					_bcast = None
+				if stringArg1 and _bcast is not None and action == _bcast:
+					_lan.send_chat(stringArg1)
+		except Exception:
+			pass
 		chatActionData = CHAT_ACTION_DATA.copy()
 		chatActionData['requestID'] = requestID
 		chatActionData['action'] = action

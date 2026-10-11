@@ -107,6 +107,10 @@ def _u(v):
 	return v
 
 
+def _html(t):
+	return t.replace(u'&', u'&amp;').replace(u'<', u'&lt;').replace(u'>', u'&gt;')
+
+
 def _s(v):
 	'''JSON gives unicode; the client's APIs want byte strings.'''
 	if isinstance(v, unicode):
@@ -513,6 +517,16 @@ class LanLink(object):
 					if a != addr:
 						self.send(a, dict(msg))
 
+		elif t == 'chat' and peer is not None:
+			name = _u(msg.get('from') or peer.name)
+			text = _u(msg.get('text') or u'')[:200]
+			if text:
+				self.show_chat(name, text)
+				if self.role == 'host':
+					for a in self.peers.keys():
+						if a != addr:
+							self.send_reliable(a, {'t': 'chat', 'from': _s(name), 'text': _s(text)})
+
 		elif t == 'end' and self.role == 'guest' and peer is not None:
 			if msg.get('bid') == self.battle_id:
 				self.end_msg = (int(msg.get('w', 0)), _s(msg.get('why', '')))
@@ -640,6 +654,32 @@ class LanLink(object):
 		if role == 'host':
 			return u' (\u0445\u043e\u0441\u0442%s)' % ((u', ' + room) if room else u'')
 		return u''
+
+	def send_chat(self, text):
+		'''A chat line from this player to everyone (the host relays).'''
+		text = _u(text).strip()[:200]
+		if not text or not self.peers:
+			return False
+		for a in self.peers.keys():
+			self.send_reliable(a, {'t': 'chat', 'from': self.name, 'text': _s(text)})
+		self.show_chat(_u(self.name), text, own=True)
+		return True
+
+	def show_chat(self, name, text, own=False):
+		'''In battle: a line in the battle chat; in the hangar: a notification.'''
+		dbg('chat %s: %s' % (_s(name), _s(text)))
+		line = u'%s: %s' % (name, text)
+		try:
+			from messenger.gui import MessengerDispatcher as _MD
+			bm = getattr(_MD.g_instance, 'battleMessenger', None)
+			if bm is not None:
+				colour = 'FFD86A' if own else '80D0FF'
+				bm.addFormattedMessage(_s(u"<font color='#%s'>%s</font>" % (colour, _html(line))), False)
+				return
+		except Exception:
+			pass
+		if not own:
+			self.notify(line)
 
 	def notify(self, text):
 		'''A line in the hangar's notification list (and the debug log).'''
