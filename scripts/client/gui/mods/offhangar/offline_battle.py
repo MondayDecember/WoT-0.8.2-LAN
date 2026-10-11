@@ -16992,10 +16992,16 @@ def _offh_lan_drive_bot(m_veh, st, dt, space, p_vid, p_team, lan=None):
 	if not st[1]:
 		# dead on the host: hit points to zero, the zero-hp sweep at the top of
 		# the bot loop then runs the normal kill path (wreck, kill feed, panel).
-		# Not before the bot's model is loaded and in the world: the wreck swap
-		# works on that model.
+		# Not before the bot's model is loaded and has had a moment in the world:
+		# the wreck swap works on that model. (Not via model.inWorld - in this
+		# client it reads False for bot models that render fine, see the note at
+		# _verify_bot_visible, so waiting on it never ended.)
+		import time as _tm
 		_ch = getattr(m_veh, '_chassis_model', None)
-		if _ch is None or not getattr(_ch, 'inWorld', False):
+		_seen = getattr(m_veh, '_lan_seen_t', None)
+		if _seen is None:
+			m_veh._lan_seen_t = _seen = _tm.time()
+		if _ch is None or _tm.time() - _seen < 2.0:
 			if not getattr(m_veh, '_lan_kill_wait_logged', False):
 				m_veh._lan_kill_wait_logged = True
 				_offh_lan_dbg('bot %s dead on host, waiting for its model before the kill' % getattr(m_veh, 'id', '?'))
@@ -17008,6 +17014,9 @@ def _offh_lan_drive_bot(m_veh, st, dt, space, p_vid, p_team, lan=None):
 		_offh_lan_dbg('bot %s killed by %s (from host)' % (getattr(m_veh, 'id', '?'), _k))
 		_offh_lan_tracks(m_veh, 0.0)
 		return
+	if getattr(m_veh, '_lan_seen_t', None) is None:
+		import time as _tm
+		m_veh._lan_seen_t = _tm.time()
 	_offh_lan_apply_pose(m_veh, st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], dt, space)
 	hp = st[11]
 	if hp != getattr(m_veh, 'health', hp):
