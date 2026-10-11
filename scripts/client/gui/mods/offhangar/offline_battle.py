@@ -17085,6 +17085,7 @@ def _step_on_enqueued(player, vehInvID, cmdName):
 								break
 				except Exception: pass
 				LOG_DEBUG('OfflineBattle.arenaType.real', map_name, 'arenaTypeID', arena.arenaTypeID, 'geomName', getattr(real_arena_type, 'geometryName', ''), 'minimap', hasattr(real_arena_type, 'minimap'))
+				_offh_lan_dbg('map loaded: ctx %s %s -> arena %s %s' % (map_id, map_name, arena.arenaTypeID, getattr(real_arena_type, 'geometryName', '')))
 			elif getattr(arena, 'arenaType', None) is not None:
 				# Fallback: keep stub, but ensure required attrs exist.
 				arena.arenaTypeID = map_id

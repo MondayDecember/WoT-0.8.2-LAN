@@ -171,27 +171,30 @@ def build_offline_battle_context(player, selected_veh_inv_id, cmdName=''):
 		
 		# Override if user selected a map via Demonstrator UI
 		sel_map_id = getattr(player, '_offhangar_selected_mapId', None)
-		# LAN guest: the host has already picked the map for this battle.
+		# LAN guest: the host has already picked the map. Take the host's exact
+		# (map_id, map_name) pair and skip every lookup below: the pool's numeric
+		# prefix and the client's arena ids do not always agree, so resolving the
+		# id on the guest could land on a different map than the host loaded.
+		_lan_map = None
 		try:
 			import sys as _sys_lan
 			_lanmod = _sys_lan.modules.get('gui.mods.mod_lanlink')
 			_lan = _lanmod.get() if _lanmod is not None else None
 			if _lan is not None and _lan.role == 'guest':
 				_lan_map = _lan.take_forced_map()
-				if _lan_map is not None:
-					sel_map_id = _lan_map
-					if isinstance(sel_map_id, unicode):
-						sel_map_id = sel_map_id.encode('utf-8')
-					LOG_DEBUG('LAN: map from host', sel_map_id)
 		except Exception:
-			pass
+			_lan_map = None
+		if _lan_map is not None:
+			map_id, map_name = _lan_map
+			sel_map_id = None
+			LOG_DEBUG('LAN: map from host', map_id, map_name)
 		# config 'force_map' does the same thing for testing, and hooks HERE
 		# rather than on the Fight button because the regular-battle path
 		# deliberately deletes _offhangar_selected_mapId - so setting that
 		# attribute from config would be wiped before it was ever read.
 		# Accepts '02_malinovka' or just 'malinovka': the string branch below
 		# already matches either way round.
-		if sel_map_id is None:
+		if sel_map_id is None and _lan_map is None:
 			try:
 				from _constants import CONFIG_OPTIONS as _CFG_FM
 				_fm = str(_CFG_FM.get('force_map', '') or '').strip()
@@ -218,7 +221,7 @@ def build_offline_battle_context(player, selected_veh_inv_id, cmdName=''):
 				map_name = ArenaType.g_cache[map_id].geometryName
 		
 		# If we still haven't resolved it, resolve the randomly chosen map_name
-		if map_id not in ArenaType.g_cache:
+		if map_id not in ArenaType.g_cache and _lan_map is None:
 			for k, v in ArenaType.g_cache.iteritems():
 				if getattr(v, 'geometryName', '') == map_name:
 					map_id = k

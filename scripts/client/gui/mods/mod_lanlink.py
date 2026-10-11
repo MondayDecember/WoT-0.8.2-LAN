@@ -411,7 +411,7 @@ class LanLink(object):
 				self.slots[pids[i]] = i + 1
 			self.broadcast_reliable({'t': 'start', 'bid': self.battle_id,
 			                         'map_id': map_id, 'map_name': map_name, 'slots': self.slots})
-			self.last_event = 'battle %s started on %s, sent to %d guest(s)' % (self.battle_id, map_name, len(self.peers))
+			self.last_event = 'battle %s started on %s (id %s), sent to %d guest(s)' % (self.battle_id, map_name, map_id, len(self.peers))
 			_log(self.last_event)
 			dbg(self.last_event)
 		else:
@@ -436,10 +436,9 @@ class LanLink(object):
 		self.slots = {}
 		for k, v in (msg.get('slots') or {}).items():
 			self.slots[_s(k)] = int(v)
-		self.forced_map = msg.get('map_id')
-		if self.forced_map is None:
-			self.forced_map = msg.get('map_name')
-		self.last_event = 'host started battle %s on %s' % (bid, msg.get('map_name'))
+		# the host's exact (map_id, map_name) pair - see offline_battle_stack
+		self.forced_map = (msg.get('map_id'), _s(msg.get('map_name')))
+		self.last_event = 'host started battle %s on %s (id %s)' % (bid, msg.get('map_name'), msg.get('map_id'))
 		_log(self.last_event)
 		dbg(self.last_event)
 		BigWorld.callback(0.0, self._start_local_battle)
