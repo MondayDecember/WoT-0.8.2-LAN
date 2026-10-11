@@ -199,6 +199,9 @@ class LanLink(object):
 		self.frames = 0
 		self.frame_max = 0.0
 		self.last_beat = 0.0
+		self.tick_sum = 0.0
+		self.tick_n = 0
+		self.tick_max = 0.0
 
 	# --- socket ---------------------------------------------------------
 
@@ -568,6 +571,13 @@ class LanLink(object):
 			self.send(addr, dict(msg))
 		self.poses_out += 1
 
+	def note_tick(self, dt):
+		'''Battle tick duration of one frame (from offline_battle).'''
+		self.tick_sum += dt
+		self.tick_n += 1
+		if dt > self.tick_max:
+			self.tick_max = dt
+
 	def bots_due(self):
 		'''Host: time to send the next bot snapshot?'''
 		if not self.peers:
@@ -652,12 +662,17 @@ class LanLink(object):
 		self.last_tick = now
 		self.frames += 1
 		if self.in_lan_battle and now - self.last_beat >= 1.0:
-			dbg('beat fps=%d max_frame=%.0fms peers=%d bots=%d poses=%d' % (
+			dbg('beat fps=%d max_frame=%.0fms tick avg=%.0fms max=%.0fms peers=%d bots=%d poses=%d' % (
 				self.frames / max(0.001, now - self.last_beat) if self.last_beat else 0,
-				self.frame_max * 1000.0, len(self.peers), len(self.bots), len(self.poses)))
+				self.frame_max * 1000.0,
+				(self.tick_sum / self.tick_n * 1000.0) if self.tick_n else -1, self.tick_max * 1000.0,
+				len(self.peers), len(self.bots), len(self.poses)))
 			self.last_beat = now
 			self.frames = 0
 			self.frame_max = 0.0
+			self.tick_sum = 0.0
+			self.tick_n = 0
+			self.tick_max = 0.0
 		for msg, addr in self.recv_all():
 			self.handle(msg, addr)
 

@@ -7011,6 +7011,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			try:
 				import BigWorld, Math, Keys, math
 				_PROBE.begin()
+				_offh_lan_tick_begin()
 				player = BigWorld.player()
 				
 				# Stop the loop if battle is over
@@ -10173,7 +10174,8 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# nodes per frame against the LIVE 0.8.2 terrain. No-op on maps we
 				# have not baked.
 				_lan_t = _offh_lan()
-				_lan_guest_bots = _lan_t is not None and _lan_t.role == 'guest' and _lan_t.in_lan_battle
+				_lan_guest_bots = (_lan_t is not None and _lan_t.role == 'guest' and _lan_t.in_lan_battle
+				                   and _lan_t.cfg.get('guest_follow_bots', True))
 				_lan_loop_t0 = time.time() if _lan_t is not None else 0.0
 				# Bot navigation only matters where the bot AI runs: a LAN guest's bots
 				# follow the host, so it skips routes, profiles and the nav grid.
@@ -12456,6 +12458,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				except Exception:
 					pass
 				_PROBE.end()
+				_offh_lan_tick_end()
 				BigWorld.callback(0.0, _aih_tick)
 			except Exception as e:
 				import traceback
@@ -16825,6 +16828,27 @@ def _offh_lan_vehname(compact_descr):
 		return vd.type.name
 	except Exception:
 		return None
+
+
+_g_lan_tick_t0 = [0.0]
+
+
+def _offh_lan_tick_begin():
+	_g_lan_tick_t0[0] = time.time()
+
+
+def _offh_lan_tick_end():
+	"""Time spent in the battle tick (Python) this frame, for the LAN heartbeat:
+	frame time minus this is the engine's share (rendering etc.)."""
+	try:
+		if _g_lan_tick_t0[0]:
+			import sys
+			m = sys.modules.get('gui.mods.mod_lanlink')
+			lan = m.get() if m is not None else None
+			if lan is not None:
+				lan.note_tick(time.time() - _g_lan_tick_t0[0])
+	except Exception:
+		pass
 
 
 def _offh_lan_dbg(msg):
