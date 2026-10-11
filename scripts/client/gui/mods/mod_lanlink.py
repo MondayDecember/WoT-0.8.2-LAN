@@ -32,6 +32,8 @@ PROTO = 'WOTLAN3'
 USER_DIR = 'offhangar_user'
 CFG_FILE = os.path.join(USER_DIR, 'lan.json')
 STATUS_FILE = os.path.join(USER_DIR, 'lanlink.txt')
+DEBUG_FILE = os.path.join(USER_DIR, 'lan_debug.log')
+SLOW_FRAME = 0.25      # a gap between two ticks longer than this gets logged
 
 DEFAULT_CFG = {
 	'role': 'host',
@@ -59,6 +61,27 @@ def _log(msg):
 		if isinstance(msg, unicode):
 			msg = msg.encode('utf-8')
 		print '[LAN] %s' % msg
+	except Exception:
+		pass
+
+
+_dbg_count = [0]
+
+
+def dbg(msg):
+	'''Append one line to lan_debug.log and close the file right away, so the
+	line is on disk even if the client hangs or is killed a moment later.'''
+	_dbg_count[0] += 1
+	if _dbg_count[0] > 20000:
+		return
+	try:
+		if isinstance(msg, unicode):
+			msg = msg.encode('utf-8')
+		f = open(DEBUG_FILE, 'a')
+		try:
+			f.write('%s %s\n' % (time.strftime('%H:%M:%S'), msg))
+		finally:
+			f.close()
 	except Exception:
 		pass
 
@@ -171,6 +194,11 @@ class LanLink(object):
 		self.bots_in = 0
 		self.bots_out = 0
 		self.last_event = ''
+		# frame watch
+		self.last_tick = 0.0
+		self.frames = 0
+		self.frame_max = 0.0
+		self.last_beat = 0.0
 
 	# --- socket ---------------------------------------------------------
 
@@ -182,7 +210,12 @@ class LanLink(object):
 			s.bind(('0.0.0.0', 0))
 		s.setblocking(0)
 		self.sock = s
+		try:
+			open(DEBUG_FILE, 'w').close()
+		except Exception:
+			pass
 		_log('started as %s, bound 0.0.0.0:%d' % (self.role, s.getsockname()[1]))
+		dbg('started as %s %s' % (self.role, self.name))
 		if self.role == 'guest':
 			self.host_addr = (str(self.cfg['host_ip']), self.cfg['port'])
 			_log('will connect to %s:%d' % self.host_addr)
@@ -305,11 +338,13 @@ class LanLink(object):
 			peer.veh_bid = msg.get('bid')
 			self.last_event = '%s is in battle %s on %s' % (peer.name, peer.veh_bid, peer.veh)
 			_log(self.last_event)
+			dbg(self.last_event)
 
 		elif t == 'plan' and self.role == 'guest' and peer is not None:
 			self.set_plan(self._jobs_from_wire(msg.get('jobs') or []), msg.get('bid'))
 			self.last_event = 'plan received: %d tanks (battle %s), my slot %s' % (len(self.plan), self.plan_bid, self.my_spawn)
 			_log(self.last_event)
+			dbg(self.last_event)
 
 		elif t == 'need_plan' and self.role == 'host' and peer is not None:
 			if self.plan is not None and msg.get('bid') == self.plan_bid:
@@ -375,6 +410,7 @@ class LanLink(object):
 			                         'map_id': map_id, 'map_name': map_name, 'slots': self.slots})
 			self.last_event = 'battle %s started on %s, sent to %d guest(s)' % (self.battle_id, map_name, len(self.peers))
 			_log(self.last_event)
+			dbg(self.last_event)
 		else:
 			# a guest battle is a LAN battle only if the host started it
 			self.in_lan_battle = self.pending_start and time.time() - self.pending_start_at < 20.0
@@ -402,6 +438,7 @@ class LanLink(object):
 			self.forced_map = msg.get('map_name')
 		self.last_event = 'host started battle %s on %s' % (bid, msg.get('map_name'))
 		_log(self.last_event)
+		dbg(self.last_event)
 		BigWorld.callback(0.0, self._start_local_battle)
 
 	def _start_local_battle(self):
@@ -606,6 +643,21 @@ class LanLink(object):
 
 	def _tick(self):
 		now = time.time()
+		if self.last_tick:
+			gap = now - self.last_tick
+			if gap > self.frame_max:
+				self.frame_max = gap
+			if gap > SLOW_FRAME:
+				dbg('slow frame %.2fs' % gap)
+		self.last_tick = now
+		self.frames += 1
+		if self.in_lan_battle and now - self.last_beat >= 1.0:
+			dbg('beat fps=%d max_frame=%.0fms peers=%d bots=%d poses=%d' % (
+				self.frames / max(0.001, now - self.last_beat) if self.last_beat else 0,
+				self.frame_max * 1000.0, len(self.peers), len(self.bots), len(self.poses)))
+			self.last_beat = now
+			self.frames = 0
+			self.frame_max = 0.0
 		for msg, addr in self.recv_all():
 			self.handle(msg, addr)
 
@@ -644,6 +696,7 @@ class LanLink(object):
 		for addr, peer in list(self.peers.items()):
 			if now - peer.last_seen > PEER_TIMEOUT:
 				_log('peer timed out: %s' % peer.name)
+				dbg('peer timed out: %s' % peer.name)
 				del self.peers[addr]
 
 		if now - self.last_status >= 2.0:

@@ -10174,6 +10174,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				# have not baked.
 				_lan_t = _offh_lan()
 				_lan_guest_bots = _lan_t is not None and _lan_t.role == 'guest' and _lan_t.in_lan_battle
+				_lan_loop_t0 = time.time() if _lan_t is not None else 0.0
 				# Bot navigation only matters where the bot AI runs: a LAN guest's bots
 				# follow the host, so it skips routes, profiles and the nav grid.
 				if not _lan_guest_bots:
@@ -11999,6 +12000,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							import traceback
 							LOG_DEBUG('Bot AI Exception:', traceback.format_exc())
 							
+				if _lan_t is not None:
+					_lan_loop_dt = time.time() - _lan_loop_t0
+					if _lan_loop_dt > 0.1:
+						_offh_lan_dbg('bot loop took %.0f ms (%d tanks)' % (_lan_loop_dt * 1000.0, len(mock_vehicles)))
 				# LAN host: publish every bot's state to the guests (~15 per second)
 				try:
 					if _lan_t is not None and _lan_t.role == 'host' and _lan_t.in_lan_battle and _lan_t.bots_due():
@@ -16822,12 +16827,30 @@ def _offh_lan_vehname(compact_descr):
 		return None
 
 
+def _offh_lan_dbg(msg):
+	try:
+		import sys
+		m = sys.modules.get('gui.mods.mod_lanlink')
+		if m is not None:
+			m.dbg(msg)
+	except Exception:
+		pass
+
+
 def _offh_angle_lerp(a, b, k):
+	"""Interpolate between two angles the short way round. No while-loop wrap:
+	an absurd input (huge or inf) must not be able to spin forever."""
 	import math
-	d = b - a
-	while d > math.pi: d -= 2 * math.pi
-	while d < -math.pi: d += 2 * math.pi
-	return a + d * k
+	try:
+		a = float(a)
+		b = float(b)
+		d = math.atan2(math.sin(b - a), math.cos(b - a))
+		if d != d:          # NaN
+			return b if b == b else 0.0
+		r = a + d * k
+		return math.atan2(math.sin(r), math.cos(r))
+	except Exception:
+		return 0.0
 
 
 def _offh_lan_apply_pose(m_veh, px, py, pz, ryaw, rpitch, rroll, ty, gp, v, dt, space):
@@ -16838,6 +16861,7 @@ def _offh_lan_apply_pose(m_veh, px, py, pz, ryaw, rpitch, rroll, ty, gp, v, dt, 
 	if not getattr(m_veh, '_lan_has_pose', False):
 		m_veh._lan_has_pose = True
 		k = 1.0
+		_offh_lan_dbg('tank %s first pose (%.0f, %.0f, %.0f)' % (getattr(m_veh, 'id', '?'), px, py, pz))
 	else:
 		k = min(1.0, dt * 12.0)
 	cur = m_veh.position
@@ -16910,6 +16934,7 @@ def _offh_lan_set_spotted(m_veh, visible, p_vid):
 			return
 		m_veh._lan_spot_applied = True
 		m_veh._spot_visible = now_vis
+		_offh_lan_dbg('bot %s %s' % (getattr(m_veh, 'id', '?'), 'spotted' if now_vis else 'hidden'))
 		ch = getattr(m_veh, '_chassis_model', None)
 		if ch is not None:
 			try:
@@ -16942,12 +16967,21 @@ def _offh_lan_drive_bot(m_veh, st, dt, space, p_vid, p_team, lan=None):
 		return
 	if not st[1]:
 		# dead on the host: hit points to zero, the zero-hp sweep at the top of
-		# the bot loop then runs the normal kill path (wreck, kill feed, panel)
+		# the bot loop then runs the normal kill path (wreck, kill feed, panel).
+		# Not before the bot's model is loaded and in the world: the wreck swap
+		# works on that model.
+		_ch = getattr(m_veh, '_chassis_model', None)
+		if _ch is None or not getattr(_ch, 'inWorld', False):
+			if not getattr(m_veh, '_lan_kill_wait_logged', False):
+				m_veh._lan_kill_wait_logged = True
+				_offh_lan_dbg('bot %s dead on host, waiting for its model before the kill' % getattr(m_veh, 'id', '?'))
+			return
 		_k = st[2] if len(st) > 2 else -1
 		if lan is not None:
 			_k = lan.local_killer(_k, p_vid)
 		m_veh.last_killer_id = _k
 		m_veh.health = 0
+		_offh_lan_dbg('bot %s killed by %s (from host)' % (getattr(m_veh, 'id', '?'), _k))
 		_offh_lan_tracks(m_veh, 0.0)
 		return
 	_offh_lan_apply_pose(m_veh, st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], dt, space)
