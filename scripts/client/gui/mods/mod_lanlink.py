@@ -258,6 +258,7 @@ class LanLink(object):
 		self.damage_in = []      # host: (eid, dmg, pid) hits reported by guests
 		self.end_msg = None      # guest: (winner, reason) from the host
 		self.capture = {}        # guest: team -> [points, interrupted] from the host
+		self.host_period = None  # guest: the host's arena period (2 countdown, 3 battle)
 		self.capture_changed = {}
 		self.stats_done = None   # host: battle id already booked in lan_stats.json
 		self.shots_sent = 0
@@ -488,6 +489,8 @@ class LanLink(object):
 			pl = msg.get('pl') or {}
 			for k in pl:
 				self.players[_s(k)] = pl[k]
+			if msg.get('per') is not None:
+				self.host_period = int(msg.get('per'))
 			cap = msg.get('cap') or {}
 			for k in cap:
 				try:
@@ -704,6 +707,7 @@ class LanLink(object):
 		self.end_msg = None
 		self.capture = {}
 		self.capture_changed = {}
+		self.host_period = None
 		self.my_spawn = None
 		if self.role == 'host':
 			self.plan = None
@@ -900,13 +904,15 @@ class LanLink(object):
 		self.last_bots_sent = now
 		return True
 
-	def send_bots(self, states, players=None, capture=None):
+	def send_bots(self, states, players=None, capture=None, period=None):
 		'''Host: one snapshot of all bots plus every player's hit points
 		(compressed when large).'''
 		self.seq += 1
 		msg = {'t': 'bots', 'bid': self.battle_id, 'n': self.seq, 'b': states, 'pl': players or {}}
 		if capture:
 			msg['cap'] = capture
+		if period is not None:
+			msg['per'] = int(period)
 		for addr in self.peers.keys():
 			self.send(addr, dict(msg))
 		self.bots_out += 1

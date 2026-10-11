@@ -6787,8 +6787,25 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					return
 
 				# LAN guest with its host: base capture is decided on the host, and the
-				# result arrives as the end of the battle (cleanup above still runs)
+				# result arrives as the end of the battle (cleanup above still runs).
+				# The countdown -> battle switch lives further down in this tick, so
+				# the guest does it here: when the host's battle has started, or when
+				# its own countdown runs out, whichever comes first.
 				if _offh_lan_guest_follows():
+					try:
+						if getattr(player.arena, 'period', 0) == 2:
+							_lan_pr = _offh_lan()
+							_host_on = _lan_pr is not None and _lan_pr.host_period == 3
+							if _host_on or BigWorld.serverTime() >= getattr(player.arena, 'periodEndTime', 0):
+								_offh_lan_dbg('battle period starts (%s)' % ('host started' if _host_on else 'own countdown'))
+								player.arena.period = 3
+								player.arena.periodLength = 900
+								player.arena.periodEndTime = BigWorld.serverTime() + 900
+								player.arena.onPeriodChange(3, player.arena.periodEndTime, 900, {})
+								_offh_notify('start_battle')
+								_offh_battle_music()
+					except Exception as _gpe:
+						_offh_lan_dbg('guest period switch error: %r' % (_gpe,))
 					return
 				# Get alive vehicles per team
 				vehs_by_team = {1: [], 2: []}
@@ -12107,7 +12124,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_lan_cap[str(_lct)] = [int(_lcs.get('points', 0) or 0), 1 if _lcs.get('lan_broken') else 0]
 						except Exception:
 							pass
-						_lan_t.send_bots(_lan_bs, _lan_pl, _lan_cap)
+						_lan_t.send_bots(_lan_bs, _lan_pl, _lan_cap, getattr(getattr(player, 'arena', None), 'period', None))
 				except Exception:
 					pass
 
