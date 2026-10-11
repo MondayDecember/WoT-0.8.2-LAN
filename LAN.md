@@ -45,6 +45,15 @@ puts the launcher next to `WorldOfTanks.exe`. `offhangar_user` is untouched.
 - The hangar header shows the launcher nickname unless `config.json` sets its
   own `nickname`.
 
+## Measuring where the frame goes
+
+`"profile": true` in `offhangar_user/lan.json` (solo or LAN). 45 s into the
+next battle the mod measures 20 s plainly (fps, frame time, battle tick time,
+the rest = rendering), then 40 s under cProfile, and writes
+`offhangar_user/tick_profile.txt` (top functions by own and total time per
+frame, engine calls included). Once per game session. `config.json`'s
+`perf_debug` does nothing in this build (its probe was removed upstream).
+
 ## Setup
 
 Config file `<game folder>/offhangar_user/lan.json` (created on first start):

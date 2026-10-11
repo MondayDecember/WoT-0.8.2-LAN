@@ -12644,6 +12644,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 				_PROBE.end()
 				BigWorld.callback(0.0, _aih_tick)
 			return
+		# Tick profiler (lan.json "profile": true): wrap the tick. The body
+		# reschedules itself through the name _aih_tick, so rebinding the name
+		# makes every later frame go through the wrapper.
+		if _offh_profile_wanted():
+			_aih_tick_plain = _aih_tick
+			def _aih_tick():
+				_offh_profiled_tick(_aih_tick_plain)
+			LOG_DEBUG('tick profiler armed')
 		# Battle starts here: open the CSV and log what this client renders at.
 		_PROBE.start()
 		_dump_graphics()
@@ -17124,6 +17132,136 @@ def _offh_lan_tick_end():
 				lan.note_tick(time.time() - _g_lan_tick_t0[0])
 	except Exception:
 		pass
+
+
+# --- Tick profiler -----------------------------------------------------------
+# Switched on by "profile": true in offhangar_user/lan.json (works in solo
+# battles too). 45 s into a battle it first measures 20 s plainly (frame time,
+# and how much of it is the battle tick), then runs the tick under cProfile
+# for 40 s and writes offhangar_user/tick_profile.txt: which functions -
+# including engine calls like wg_collideSegment - eat the tick. Once per game
+# session; the plain tick is untouched when the flag is off.
+_g_prof = {'t0': None, 'phase': 0, 'p': None, 'frames': 0, 'tick': 0.0,
+           'last': None, 'frame_sum': 0.0, 'frame_max': 0.0, 'prof_t0': None,
+           'prof_frames': 0, 'plain': None, 'done': False}
+
+
+def _offh_profile_wanted():
+	try:
+		import os, json
+		path = os.path.join('offhangar_user', 'lan.json')
+		if not os.path.isfile(path):
+			return False
+		f = open(path, 'rb')
+		try:
+			raw = f.read()
+		finally:
+			f.close()
+		if raw[:3] == '\xef\xbb\xbf':
+			raw = raw[3:]
+		return bool(json.loads(raw.decode('utf-8')).get('profile'))
+	except Exception:
+		return False
+
+
+def _offh_profiled_tick(fn):
+	st = _g_prof
+	if st['done']:
+		return fn()
+	clk = time.clock
+	now = clk()
+	if st['t0'] is None:
+		st['t0'] = now
+	if st['last'] is not None:
+		gap = now - st['last']
+		if st['phase'] == 1:
+			st['frame_sum'] += gap
+			if gap > st['frame_max']:
+				st['frame_max'] = gap
+	st['last'] = now
+	el = now - st['t0']
+	if st['phase'] == 0 and el >= 45.0:
+		st['phase'] = 1
+		st['plain'] = now
+	if st['phase'] == 1 and now - st['plain'] >= 20.0:
+		st['phase'] = 2
+		p = None
+		try:
+			import cProfile
+			p = cProfile.Profile()
+		except Exception:
+			try:
+				import profile
+				p = profile.Profile()
+			except Exception:
+				p = None
+		if p is None:
+			_offh_profile_write(None)
+			st['done'] = True
+			return fn()
+		st['p'] = p
+		st['prof_t0'] = now
+	if st['phase'] == 1:
+		t = clk()
+		r = fn()
+		st['tick'] += clk() - t
+		st['frames'] += 1
+		return r
+	if st['phase'] == 2:
+		st['prof_frames'] += 1
+		r = st['p'].runcall(fn)
+		if now - st['prof_t0'] >= 40.0:
+			st['done'] = True
+			_offh_profile_write(st['p'])
+		return r
+	return fn()
+
+
+def _offh_profile_write(p):
+	st = _g_prof
+	try:
+		import os
+		lines = []
+		n = max(1, st['frames'])
+		frame = st['frame_sum'] / n * 1000.0
+		tick = st['tick'] / n * 1000.0
+		lines.append('WITHOUT profiler, %d frames:' % st['frames'])
+		lines.append('  fps %.1f   frame %.1f ms (max %.0f ms)   battle tick %.1f ms   rest (render etc.) %.1f ms'
+			% (1000.0 / max(0.001, frame), frame, st['frame_max'] * 1000.0, tick, frame - tick))
+		try:
+			ms = globals().get('G_MOCK_VEHICLES')
+			lines.append('  bots/tanks: %s' % (len(ms) if ms is not None else '?'))
+		except Exception:
+			pass
+		if p is None:
+			lines.append('no cProfile/profile module in this client - only the numbers above')
+		else:
+			p.create_stats()
+			rows = []
+			for key, val in p.stats.items():
+				cc, nc, tt, ct = val[0], val[1], val[2], val[3]
+				fname, line, func = key
+				where = '%s:%s' % (os.path.basename(str(fname)), line) if line else str(fname)
+				rows.append((tt, ct, nc, func, where))
+			pf = max(1, st['prof_frames'])
+			lines.append('')
+			lines.append('WITH profiler, %d frames (slower than real; compare shares, not totals).' % pf)
+			for title, idx in (('TOP by own time (ms per frame)', 0), ('TOP by total time incl. callees (ms per frame)', 1)):
+				lines.append('')
+				lines.append(title)
+				lines.append('    own_ms   total_ms    calls/frame  function')
+				rows.sort(key=lambda r: -r[idx])
+				for tt, ct, nc, func, where in rows[:45]:
+					lines.append('  %8.2f  %9.2f  %12.1f  %s  (%s)' % (tt * 1000.0 / pf, ct * 1000.0 / pf, float(nc) / pf, func, where))
+		f = open(os.path.join('offhangar_user', 'tick_profile.txt'), 'w')
+		try:
+			f.write('\n'.join(lines) + '\n')
+		finally:
+			f.close()
+		_offh_battle_message('Профиль записан: offhangar_user/tick_profile.txt', '66DD66')
+	except Exception:
+		import traceback
+		LOG_DEBUG('tick profile write failed:', traceback.format_exc())
 
 
 def _offh_lan_dbg(msg):
