@@ -450,12 +450,17 @@ class LanLink(object):
 				self.my_spawn = (j[1], j[2], j[3])
 
 	def local_jobs(self):
-		'''Jobs this client spawns: everything except its own tank.'''
+		'''Jobs this client spawns: everything except its own tank. Each job
+		gets its index in the full line-up as an 8th field, so a tank has the
+		same entity id (1000 + index) on every client even though each client
+		skips a different job (its own tank).'''
 		out = []
-		for j in self.plan or []:
+		plan = self.plan or []
+		for i in range(len(plan)):
+			j = plan[i]
 			if j[5] is not None and j[5] == self.my_id:
 				continue
-			out.append(j)
+			out.append((j[0], j[1], j[2], j[3], j[4], j[5], j[6], i))
 		return out
 
 	def guest_plan(self):

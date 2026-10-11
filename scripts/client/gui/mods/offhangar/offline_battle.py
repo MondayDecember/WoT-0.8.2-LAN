@@ -15567,8 +15567,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# LAN: this slot is another player's tank, not a bot
 						_lan_remote_id = getattr(player, '_forced_spawn_remote', None)
 						_lan_remote_name = getattr(player, '_forced_spawn_remote_name', None)
+						_lan_eid = getattr(player, '_forced_spawn_eid', None)
 						if _lan_remote_id and _lan_remote_name:
 							bot_name = _lan_remote_name
+						elif _lan_eid is not None:
+							# same number in the name on every client, matching the entity id
+							try: bot_name = bot_name.rsplit(' ', 1)[0] + ' ' + str(_lan_eid - 1000)
+							except Exception: pass
 
 						# OOM guard: each bot is a full tank (models + textures +
 						# per-component VehicleStickers + recoil). Spawning far past a
@@ -15592,6 +15597,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						
 						e_id = 1000 + _spawn_count[0]
 						_spawn_count[0] += 1
+						if _lan_eid is not None:
+							# LAN line-up: the id comes from the job's place in the shared list
+							e_id = _lan_eid
+							if _spawn_count[0] < _lan_eid - 1000 + 1:
+								_spawn_count[0] = _lan_eid - 1000 + 1
 						
 						# Load visual models
 						
@@ -16056,6 +16066,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_t, _x, _z, _yw, _vn = _rest[0][:5]
 						_lan_rid = _rest[0][5] if len(_rest[0]) > 5 else None
 						_lan_rname = _rest[0][6] if len(_rest[0]) > 6 else None
+						_lan_idx = _rest[0][7] if len(_rest[0]) > 7 else None
 						try:
 							_p2 = BigWorld.player()
 							# Bot ground height. Probe the BATTLE space (_offh_bspace); if it misses
@@ -16105,6 +16116,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_p2._forced_spawn_vehname = _vn
 							_p2._forced_spawn_remote = _lan_rid
 							_p2._forced_spawn_remote_name = _lan_rname
+							_p2._forced_spawn_eid = (1000 + int(_lan_idx)) if _lan_idx is not None else None
 							try:
 								_mock_handleKeyEvent(_FakeSpawnEvent(Keys.KEY_P))
 							finally:
@@ -16114,6 +16126,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_p2._forced_spawn_vehname = None
 								_p2._forced_spawn_remote = None
 								_p2._forced_spawn_remote_name = None
+								_p2._forced_spawn_eid = None
 						except Exception as _se:
 							LOG_DEBUG('AUTO-SPAWN error:', str(_se))
 						BigWorld.callback(0.3, lambda: _spawn_next(_rest[1:]))
