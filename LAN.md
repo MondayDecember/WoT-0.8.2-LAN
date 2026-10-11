@@ -15,6 +15,36 @@ Goal: several players in one offline battle, one PC acting as the host.
 | 3+ | Capture bar, results, stats, chat, lobby, launcher, module crits | testing |
 | 4 | Play over the internet (WireGuard / port forward) | todo |
 
+## Install / update
+
+Close the game, then in PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/MondayDecember/WoT-0.8.2-LAN/lan/step3-shooting/tools/update_mod.ps1)))
+```
+
+It updates `C:\World_of_Tanks_0.08.02.00.00_RU_0349_SD` and `C:\WoT082_guest`
+(whichever exist; add `-GameDir 'D:\path'` for another folder): copies the
+mod into `res_mods\0.8.2`, deletes `.pyc` files the mod no longer ships, and
+puts the launcher next to `WorldOfTanks.exe`. `offhangar_user` is untouched.
+
+## Bots: spawn, navigation, count
+
+- Bots no longer spawn on roofs, ledges, slopes, against walls or in water:
+  each line-up slot is checked and, if it is bad, the nearest clean spot
+  within 35 m is used. While the far base's terrain is still streaming in,
+  the spawn waits for it instead of guessing a height (that guess was what
+  dropped bots from the sky).
+- `nav_grid_all_maps` (config.json, default on): every map is measured into
+  a navigation grid on its first battle (~10 s, during the countdown; saved
+  in `offhangar_user/nav_dump`). Bots then path around buildings and get
+  class routes on every map, not only on hand-painted ones.
+- Bot count: the launcher's "Ботов в команде" writes `bots_per_team`. In a
+  LAN battle only the host's number counts. Fewer bots is the biggest FPS
+  win: the bot simulation runs on one CPU core.
+- The hangar header shows the launcher nickname unless `config.json` sets its
+  own `nickname`.
+
 ## Setup
 
 Config file `<game folder>/offhangar_user/lan.json` (created on first start):

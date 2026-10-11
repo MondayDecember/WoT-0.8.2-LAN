@@ -38,6 +38,36 @@ function Save-Cfg($c) {
     [System.IO.File]::WriteAllText($cfgPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# ------------------------------------------------------------------ mod options (offhangar_user/config.json)
+$modCfgPath = Join-Path $userDir 'config.json'
+$modDefPath = Join-Path $GameDir 'res_mods\0.8.2\scripts\client\gui\mods\offhangar\config_defaults.json'
+function Get-BotsPerTeam {
+    foreach ($p in @($modCfgPath, $modDefPath)) {
+        if (Test-Path $p) {
+            $t = [System.IO.File]::ReadAllText($p)
+            if ($t -match '"bots_per_team"\s*:\s*(\d+)') { return [Math]::Min(15, [int]$Matches[1]) }
+        }
+    }
+    return 15
+}
+function Set-BotsPerTeam([int]$n) {
+    # Edits only that one number, so the rest of the file (and its comments) stays as it is.
+    try {
+        if (-not (Test-Path $userDir)) { New-Item $userDir -ItemType Directory -Force | Out-Null }
+        if (-not (Test-Path $modCfgPath)) {
+            if (Test-Path $modDefPath) { Copy-Item $modDefPath $modCfgPath } else { [System.IO.File]::WriteAllText($modCfgPath, '{}') }
+        }
+        $t = [System.IO.File]::ReadAllText($modCfgPath)
+        if ($t -match '"bots_per_team"\s*:\s*\d+') {
+            $t = [regex]::Replace($t, '"bots_per_team"\s*:\s*\d+', ('"bots_per_team": ' + $n))
+        } else {
+            $t = [regex]::Replace($t, '^\s*\{', ('{' + "`r`n" + '    "bots_per_team": ' + $n + ','))
+            $t = [regex]::Replace($t, ',\s*\}\s*$', "`r`n}")
+        }
+        [System.IO.File]::WriteAllText($modCfgPath, $t, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
 # ------------------------------------------------------------------ lobby client
 $script:udp = $null
 $script:lobbyEp = $null
@@ -251,7 +281,13 @@ $rbGuest = New-Ctl RadioButton $tPlay 'Подключиться к другу' 2
 $rbSolo  = New-Ctl RadioButton $tPlay 'Один, без сети' 20 $y 470 26; $y += 40
 switch ("$($cfg.role)") { 'guest' { $rbGuest.Checked = $true } 'off' { $rbSolo.Checked = $true } default { $rbHost.Checked = $true } }
 New-Ctl Label $tPlay 'IP хоста' 20 ($y + 2) 120 24 | Out-Null;  $bIp = New-Ctl TextBox $tPlay $cfg.host_ip 150 $y 330 26; $y += 36
-New-Ctl Label $tPlay 'Порт' 20 ($y + 2) 120 24 | Out-Null;      $bPort = New-Ctl TextBox $tPlay $cfg.port 150 $y 100 26; $y += 36
+New-Ctl Label $tPlay 'Порт' 20 ($y + 2) 120 24 | Out-Null;      $bPort = New-Ctl TextBox $tPlay $cfg.port 150 $y 100 26
+New-Ctl Label $tPlay 'Ботов в команде' 270 ($y + 2) 130 24 | Out-Null
+$bBots = New-Object System.Windows.Forms.NumericUpDown
+$bBots.Minimum = 0; $bBots.Maximum = 15; $bBots.Value = (Get-BotsPerTeam); $bBots.SetBounds(410, $y, 70, 26); $tPlay.Controls.Add($bBots)
+$tip = New-Object System.Windows.Forms.ToolTip
+$tip.SetToolTip($bBots, 'Сколько танков в каждой команде, включая игроков. Меньше ботов - больше FPS. В бою по сети считается настройка хоста.')
+$y += 36
 New-Ctl Label $tPlay 'Пароль комнаты' 20 ($y + 2) 125 24 | Out-Null; $bKey = New-Ctl TextBox $tPlay $cfg.key 150 $y 330 26; $y += 36
 New-Ctl Label $tPlay 'Комната' 20 ($y + 2) 120 24 | Out-Null;   $bRoom = New-Ctl TextBox $tPlay $cfg.room 150 $y 330 26; $y += 36
 $plHint = New-Ctl Label $tPlay '' 20 $y 470 40; $plHint.ForeColor = [System.Drawing.Color]::SteelBlue; $y += 44
@@ -292,6 +328,7 @@ $btnPlay.Add_Click({
     Set-CfgValue $cfg 'port' $port
     Set-CfgValue $cfg 'key' $bKey.Text
     Save-Cfg $cfg
+    Set-BotsPerTeam ([int]$bBots.Value)
     if (Get-Process WorldOfTanks -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe }) {
         Msg 'Игра уже запущена. Настройки сохранены, они применятся при следующем запуске.'; return
     }

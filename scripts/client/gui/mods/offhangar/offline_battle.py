@@ -1045,6 +1045,71 @@ def _offh_water_depth(x, y, z):
 	return 20.0 - _w
 
 
+def _offh_spawn_spot_check(x, z):
+	'''Is (x, z) a clean place to put a tank down?
+
+	Returns None when the terrain there is not loaded yet (collision streams in
+	by distance, so the far base often answers nothing for the first seconds),
+	else (y, ok). ok is False for a roof or balcony (lower ground right below
+	the first hit), a ledge, a slope, the foot of a wall or a building within
+	5 m (a neighbouring ray lands more than 2.5 m higher or lower), and water.
+	Those are exactly the slots bots used to fall from or get wedged in.'''
+	try:
+		import BigWorld, Math
+		sp = _offh_bspace()
+		top = BigWorld.wg_collideSegment(sp, Math.Vector3(x, 1000.0, z), Math.Vector3(x, -1000.0, z), 128)
+		if top is None:
+			return None
+		y0 = top[0].y
+		below = BigWorld.wg_collideSegment(sp, Math.Vector3(x, y0 - 0.4, z), Math.Vector3(x, -1000.0, z), 128)
+		if below is not None and (y0 - below[0].y) > 2.5:
+			return (y0, False)
+		for dx, dz in ((5.0, 0.0), (-5.0, 0.0), (0.0, 5.0), (0.0, -5.0),
+		               (3.5, 3.5), (-3.5, 3.5), (3.5, -3.5), (-3.5, -3.5)):
+			c = BigWorld.wg_collideSegment(sp, Math.Vector3(x + dx, y0 + 25.0, z + dz),
+			                               Math.Vector3(x + dx, y0 - 60.0, z + dz), 128)
+			if c is None or abs(c[0].y - y0) > 2.5:
+				return (y0, False)
+		if _offh_water_depth(x, y0, z) > 0.5:
+			return (y0, False)
+		return (y0, True)
+	except Exception:
+		return None
+
+
+def _offh_spawn_spot(x, z, taken, bounds=None):
+	'''Nearest clean spawn spot to a line-up slot: (x, y, z), or None while the
+	slot's own terrain is not loaded yet (the caller waits and asks again).
+
+	Tries the slot itself, then rings of 7..35 m around it, keeping 9 m from
+	every tank already placed and 8 m inside the arena. If nothing nearby is
+	clean the slot is used as it is - the old behaviour.'''
+	import math
+	first = _offh_spawn_spot_check(x, z)
+	if first is None:
+		return None
+	def _free(px, pz):
+		for tx, tz in taken:
+			if (px - tx) ** 2 + (pz - tz) ** 2 < 81.0:
+				return False
+		if bounds is not None:
+			if not (bounds[0] + 8.0 <= px <= bounds[2] - 8.0 and bounds[1] + 8.0 <= pz <= bounds[3] - 8.0):
+				return False
+		return True
+	if first[1] and _free(x, z):
+		return (x, first[0], z)
+	for r in (7.0, 14.0, 21.0, 28.0, 35.0):
+		for k in range(8):
+			a = k * math.pi / 4.0 + (r / 7.0) * 0.4
+			px, pz = x + math.sin(a) * r, z + math.cos(a) * r
+			if not _free(px, pz):
+				continue
+			c = _offh_spawn_spot_check(px, pz)
+			if c is not None and c[1]:
+				return (px, c[0], pz)
+	return (x, first[0], z)
+
+
 def _offh_hp_display(mock):
 	'''HP to SHOW for a mock, which is not always its .health.
 	
@@ -1822,7 +1887,7 @@ def _offh_nav_tick():
 					_q = int(_cov * 4)
 					if _q > (globals().get('g_offh_nav_q', 0) or 0) and _q < 4:
 						globals()['g_offh_nav_q'] = _q
-						_offh_nav_note('Bot navigation: measuring %s... %d%%'
+						_offh_nav_note('Навигация ботов: %s... %d%%'
 							% (g.map_name, _q * 25))
 				_last = globals().get('g_offh_nav_last_cov')
 				if _last is None or abs(_cov - _last) >= 0.10 or (g.settled() and _cov != _last):
@@ -1846,9 +1911,8 @@ def _offh_nav_tick():
 						# Coverage below 100% is normal and FINAL - void outside
 						# the playable area can never be probed. Say the useful
 						# thing (it is saved) rather than the alarming one.
-						_offh_nav_note('Bot navigation: %s measured and saved. '
-							'Bots use it from here on, and this map is never '
-							'measured again.' % g.map_name, '66DD66')
+						_offh_nav_note('Навигация ботов: карта %s измерена и сохранена.'
+							% g.map_name, '66DD66')
 				except Exception as _de:
 					LOG_DEBUG('NAVGRID dump error:', str(_de))
 					if globals().get('g_offh_nav_announced'):
@@ -1963,7 +2027,12 @@ def _offh_nav_tick():
 		# avoid areas cannot. _offh_profile_tick runs before this one, so a set
 		# g_offh_profile here means painted, never auto-generated.
 		_painted = globals().get('g_offh_profile') is not None
-		if _g is None and not _painted:
+		# nav_grid_all_maps: measure every map once (about 10k rays, 40 a frame,
+		# so ~10 s - mostly inside the pre-battle countdown) and keep it in
+		# nav_dump. Without a grid the bots drive straight at their target and
+		# grind against every house in the way.
+		_all_maps = bool(_CFG.get('nav_grid_all_maps', True))
+		if _g is None and not _painted and not _all_maps:
 			# No mesh, no paint, nobody asked. Measuring costs ~50k raycasts
 			# spread over the opening minutes, and a user who never intends to
 			# edit this map should not pay that for a map we did not ship a mesh
@@ -1978,9 +2047,8 @@ def _offh_nav_tick():
 		if _g is None:
 			_g = _NG.NavGrid(_b, _mn)
 			LOG_DEBUG('NAVGRID: building %dx%d cells @ %.1f m over %s '
-				'(this map has a painted profile)' % (_g.nx, _g.nz, _g.cell, str(_b)))
-			_offh_nav_note('Bot navigation: measuring %s. This happens once - '
-				'later battles on this map load instantly.' % _mn)
+				'(painted=%s, all maps=%s)' % (_g.nx, _g.nz, _g.cell, str(_b), _painted, _all_maps))
+			_offh_nav_note('Навигация ботов: первый бой на карте %s, измеряю её (один раз).' % _mn)
 			globals()['g_offh_nav_announced'] = True
 		globals()['g_offh_navgrid'] = _g
 	except Exception as e:
@@ -16282,37 +16350,57 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if _taken is None:
 								_taken = []
 								_p2._offh_spawn_taken = _taken
-							for _nudge in range(4):
-								_clash = False
-								for _tx, _tz in _taken:
-									if (_x - _tx) ** 2 + (_z - _tz) ** 2 < 81.0:   # < 9 m apart
-										_clash = True
-										break
-								if not _clash: break
-								import math as _mnu
-								# Nudge FORWARD (toward the enemy, i.e. into the map). Pushing backwards ran
-								# straight at the arena edge behind the base and its buildings.
-								_x += _mnu.sin(_yw) * 11.0
-								_z += _mnu.cos(_yw) * 11.0
-							# Roof-safe ground probe: while something substantially lower sits below the
-							# hit (roof / balcony / bridge), keep going down. Same walk the player uses.
+							# Bots: a clean spot near the slot - not on a roof, a ledge, a slope,
+							# against a wall or in water (_offh_spawn_spot). While the slot's terrain
+							# is not streamed in yet, wait for it instead of guessing a height: the
+							# guess (the player's own height) is what dropped bots from the sky at the
+							# far base. Player tanks (LAN) keep their slot; their owner drives them.
 							_gy = None
-							try:
-								_from_y = 1000.0
-								for _ri in range(4):
-									_gc = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_x, _from_y, _z), Math.Vector3(_x, -1000.0, _z), 128)
-									if _gc is None: break
-									_gy = _gc[0].y
-									_gc2 = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_x, _gy - 0.4, _z), Math.Vector3(_x, -1000.0, _z), 128)
-									if _gc2 is None or (_gy - _gc2[0].y) < 2.5: break
-									_from_y = _gy - 0.4
-							except Exception:
-								pass
+							if _lan_rid is None:
+								_spot = _offh_spawn_spot(_x, _z, _taken, globals().get('g_offline_bounds', None))
+								if _spot is None:
+									_wt = getattr(_p2, '_offh_spawn_wait', 0) or 0
+									if _wt < 24:
+										_p2._offh_spawn_wait = _wt + 1
+										BigWorld.callback(0.5, lambda: _spawn_next(_rest))
+										return
+									LOG_DEBUG('AUTO-SPAWN: no terrain at (%.0f, %.0f) after 12 s, old placement' % (_x, _z))
+								else:
+									_x, _gy, _z = _spot
+								_p2._offh_spawn_wait = 0
 							if _gy is None:
+								# (a player tank's slot is in _taken already - never nudge it off itself)
+								for _nudge in range(4 if _lan_rid is None else 0):
+									_clash = False
+									for _tx, _tz in _taken:
+										if (_x - _tx) ** 2 + (_z - _tz) ** 2 < 81.0:   # < 9 m apart
+											_clash = True
+											break
+									if not _clash: break
+									import math as _mnu
+									# Nudge FORWARD (toward the enemy, i.e. into the map). Pushing backwards ran
+									# straight at the arena edge behind the base and its buildings.
+									_x += _mnu.sin(_yw) * 11.0
+									_z += _mnu.cos(_yw) * 11.0
+								# Roof-safe ground probe: while something substantially lower sits below the
+								# hit (roof / balcony / bridge), keep going down. Same walk the player uses.
+								_gy = None
 								try:
-									_gy = float(veh_pos[1])
+									_from_y = 1000.0
+									for _ri in range(4):
+										_gc = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_x, _from_y, _z), Math.Vector3(_x, -1000.0, _z), 128)
+										if _gc is None: break
+										_gy = _gc[0].y
+										_gc2 = BigWorld.wg_collideSegment(_offh_bspace(), Math.Vector3(_x, _gy - 0.4, _z), Math.Vector3(_x, -1000.0, _z), 128)
+										if _gc2 is None or (_gy - _gc2[0].y) < 2.5: break
+										_from_y = _gy - 0.4
 								except Exception:
-									_gy = 100.0
+									pass
+								if _gy is None:
+									try:
+										_gy = float(veh_pos[1])
+									except Exception:
+										_gy = 100.0
 							_taken.append((_x, _z))
 							_p2._forced_spawn_pos = (_x, _gy, _z)
 							_p2._forced_spawn_team = _t
@@ -16337,7 +16425,21 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					
 					LOG_DEBUG('AUTO-SPAWN: placing %d bots (%d per team incl. player)' % (len(_jobs), _n_per_team))
 					# fresh occupancy list per battle - a stale one would nudge every new spawn
-					try: BigWorld.player()._offh_spawn_taken = []
+					# Seeded with the player's own slot and every player tank's slot, so a
+					# bot moved off a bad slot never lands on a player.
+					try:
+						_seed_taken = []
+						try:
+							_ox, _oz, _oy = _formation_slot(_p_team, 0)
+							_seed_taken.append((_ox, _oz))
+							_seed_taken.append((float(veh_pos[0]), float(veh_pos[2])))
+						except Exception:
+							pass
+						for _sj in _jobs:
+							if len(_sj) > 5 and _sj[5] is not None:
+								_seed_taken.append((_sj[1], _sj[2]))
+						BigWorld.player()._offh_spawn_taken = _seed_taken
+						BigWorld.player()._offh_spawn_wait = 0
 					except Exception: pass
 					_spawn_next(_jobs)
 				except Exception:

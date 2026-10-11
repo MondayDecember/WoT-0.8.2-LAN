@@ -23,7 +23,39 @@ from chat_shared import CHAT_RESPONSES
 
 OFFLINE_SERVER_ADDRESS = 'offline.loc'
 OFFLINE_NICKNAME = str(CONFIG_OPTIONS.get('nickname', 'Defaultplayer'))
+# The login stays the config value: it only has to reach the fake server.
 OFFLINE_LOGIN = OFFLINE_NICKNAME + '@' + OFFLINE_SERVER_ADDRESS
+
+
+def _lan_nickname():
+    '''The nickname from the LAN launcher (offhangar_user/lan.json 'name'),
+    or None. Used for the hangar header when config.json keeps the default.'''
+    try:
+        import os
+        path = os.path.join('offhangar_user', 'lan.json')
+        if not os.path.isfile(path):
+            return None
+        f = open(path, 'rb')
+        try:
+            raw = f.read()
+        finally:
+            f.close()
+        if raw[:3] == '\xef\xbb\xbf':
+            raw = raw[3:]
+        name = json.loads(raw.decode('utf-8')).get('name')
+        if not name or name == 'Player':
+            return None
+        if isinstance(name, unicode):
+            name = name.encode('utf-8')
+        return str(name).strip()[:24] or None
+    except Exception:
+        return None
+
+
+if OFFLINE_NICKNAME in ('', 'Defaultplayer'):
+    _ln = _lan_nickname()
+    if _ln:
+        OFFLINE_NICKNAME = _ln
 OFFLINE_PWD = '1'
 OFFLINE_DBID = 13028161
 
