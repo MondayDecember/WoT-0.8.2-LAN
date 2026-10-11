@@ -15,6 +15,8 @@
 #   host_ip  address of the host (guest only)
 #   port     UDP port the host listens on
 #   name     nickname shown to the other players
+#   key      optional session password; must be the same on host and guests
+#   uid      permanent player id, generated on first start
 #
 # Python 2.6 (the client's interpreter): no dict/set comprehensions,
 # str.format needs explicit indexes.
@@ -118,7 +120,39 @@ def _load_cfg():
 	cfg['role'] = str(cfg.get('role', 'host')).lower()
 	cfg['port'] = int(cfg.get('port', 27015))
 	cfg['name'] = _s(cfg.get('name', 'Player'))
+	# A permanent player id, made once and kept in lan.json: the nickname can
+	# change, this does not (stats, a future lobby and friends list key on it).
+	if not cfg.get('uid'):
+		try:
+			import random
+			cfg['uid'] = '%012x' % random.getrandbits(48)
+			_save_cfg(cfg)
+			_log('new player id %s saved to %s' % (cfg['uid'], CFG_FILE))
+		except Exception as e:
+			_log('could not save player id %r' % (e,))
+	cfg['uid'] = _s(cfg.get('uid'))
 	return cfg
+
+
+def _save_cfg(cfg):
+	'''Write lan.json back with every key the user had, plus ours.'''
+	out = {}
+	try:
+		f = open(CFG_FILE, 'r')
+		try:
+			out = json.load(f)
+		finally:
+			f.close()
+	except Exception:
+		out = {}
+	for k in ('role', 'host_ip', 'port', 'name', 'uid', 'key'):
+		if k in cfg:
+			out[k] = cfg[k]
+	f = open(CFG_FILE, 'w')
+	try:
+		json.dump(out, f, indent=4, sort_keys=True)
+	finally:
+		f.close()
 
 
 def _sock_code(e):
@@ -145,6 +179,7 @@ class Peer(object):
 		self.pongs_got = 0
 		self.veh = None          # tank this peer took into the current battle
 		self.veh_bid = None
+		self.uid = None          # permanent player id from the peer's lan.json
 
 
 class LanLink(object):
@@ -157,6 +192,7 @@ class LanLink(object):
 		self.sock = None
 		self.host_addr = None
 		self.peers = {}          # addr -> Peer
+		self.rejected = {}       # host: addresses turned away for a wrong key
 		self.next_gid = 1
 		self.seq = 0
 		self.sent_at = {}        # ping seq -> send time
@@ -197,6 +233,7 @@ class LanLink(object):
 		# shooting
 		self.shots_in = []       # shot events to play on this client
 		self.damage_in = []      # host: (eid, dmg, pid) hits reported by guests
+		self.end_msg = None      # guest: (winner, reason) from the host
 		self.shots_sent = 0
 		self.shots_got = 0
 		self.dmg_sent = 0
@@ -308,17 +345,29 @@ class LanLink(object):
 			self.pending.pop((addr, msg.get('rid')), None)
 
 		elif t == 'hello' and self.role == 'host':
+			# Session password (lan.json 'key'): with a public IP anyone can
+			# reach the port; without the right key the host does not answer.
+			want = self.cfg.get('key')
+			if want and _s(msg.get('key')) != _s(want):
+				if addr not in self.rejected:
+					self.rejected[addr] = now
+					_log('rejected %s:%d - wrong or missing key' % (addr[0], addr[1]))
+					dbg('rejected %s:%d (%s) - wrong or missing key' % (addr[0], addr[1], _s(msg.get('name', '?'))))
+				return
 			if peer is None:
 				peer = Peer(addr, _s(msg.get('name', '?')), 'g%d' % self.next_gid)
 				self.next_gid += 1
 				self.peers[addr] = peer
 				self.seen_rids.pop(addr, None)
-				_log('guest joined: %s (%s) from %s:%d' % (peer.name, peer.pid, addr[0], addr[1]))
-			self.send(addr, {'t': 'welcome', 'name': self.name, 'id': peer.pid})
+				peer.uid = _s(msg.get('uid'))
+				_log('guest joined: %s (%s, uid %s) from %s:%d' % (peer.name, peer.pid, peer.uid, addr[0], addr[1]))
+				dbg('guest joined: %s (%s, uid %s)' % (peer.name, peer.pid, peer.uid))
+			self.send(addr, {'t': 'welcome', 'name': self.name, 'id': peer.pid, 'uid': self.cfg.get('uid')})
 
 		elif t == 'welcome' and self.role == 'guest':
 			if peer is None:
 				peer = Peer(addr, _s(msg.get('name', '?')), HOST_ID)
+				peer.uid = _s(msg.get('uid'))
 				self.peers[addr] = peer
 				self.my_id = _s(msg.get('id'))
 				_log('connected to host: %s at %s:%d, my id %s' % (peer.name, addr[0], addr[1], self.my_id))
@@ -397,6 +446,13 @@ class LanLink(object):
 					if a != addr:
 						self.send(a, dict(msg))
 
+		elif t == 'end' and self.role == 'guest' and peer is not None:
+			if msg.get('bid') == self.battle_id:
+				self.end_msg = (int(msg.get('w', 0)), _s(msg.get('why', '')))
+				self.last_event = 'host ended the battle: winner %s (%s)' % self.end_msg
+				_log(self.last_event)
+				dbg(self.last_event)
+
 		elif t == 'dmg' and self.role == 'host' and peer is not None:
 			if msg.get('bid') != self.battle_id:
 				return
@@ -435,6 +491,7 @@ class LanLink(object):
 		self.players = {}
 		self.shots_in = []
 		self.damage_in = []
+		self.end_msg = None
 		self.my_spawn = None
 		if self.role == 'host':
 			self.plan = None
@@ -686,6 +743,18 @@ class LanLink(object):
 			self.send_reliable(addr, {'t': 'dmg', 'bid': self.battle_id, 'eid': int(eid), 'd': int(dmg)})
 		self.dmg_sent += 1
 
+	def send_end(self, winner, reason):
+		'''Host: the battle is over - same outcome for everyone.'''
+		if self.role != 'host' or not self.in_lan_battle:
+			return
+		self.broadcast_reliable({'t': 'end', 'bid': self.battle_id, 'w': int(winner), 'why': reason})
+		dbg('battle end sent: winner %s (%s)' % (winner, reason))
+
+	def take_end(self):
+		m = self.end_msg
+		self.end_msg = None
+		return m
+
 	def take_damage(self):
 		out = self.damage_in
 		self.damage_in = []
@@ -759,7 +828,7 @@ class LanLink(object):
 
 		if self.role == 'guest' and not self.peers and now - self.last_hello >= 1.0:
 			self.last_hello = now
-			self.send(self.host_addr, {'t': 'hello', 'name': self.name})
+			self.send(self.host_addr, {'t': 'hello', 'name': self.name, 'uid': self.cfg.get('uid'), 'key': self.cfg.get('key')})
 
 		for key in list(self.pending.keys()):
 			entry = self.pending.get(key)
@@ -800,7 +869,7 @@ class LanLink(object):
 			self.write_status()
 
 	def write_status(self):
-		lines = ['role: %s  name: %s  id: %s  uptime: %ds' % (self.role, self.name, self.my_id, int(time.time() - self.started))]
+		lines = ['role: %s  name: %s  id: %s  uid: %s  uptime: %ds' % (self.role, self.name, self.my_id, self.cfg.get('uid'), int(time.time() - self.started))]
 		if self.role == 'guest':
 			lines.append('host: %s:%d' % self.host_addr)
 		if not self.peers:
@@ -810,7 +879,7 @@ class LanLink(object):
 			if p.pings_sent:
 				lost = 100.0 * (p.pings_sent - p.pongs_got) / p.pings_sent
 			rtt = '-' if p.rtt_ms is None else '%.1f ms (min %.1f, max %.1f)' % (p.rtt_ms, p.rtt_min, p.rtt_max)
-			lines.append('peer %s [%s] %s:%d  rtt %s  loss %.0f%%' % (p.name, p.pid, addr[0], addr[1], rtt, lost))
+			lines.append('peer %s [%s, uid %s] %s:%d  rtt %s  loss %.0f%%' % (p.name, p.pid, p.uid, addr[0], addr[1], rtt, lost))
 		lines.append('lan battle: %s  id: %s  my tank: %s  slots: %s' % (
 			'yes' if self.in_lan_battle else 'no', self.battle_id, self.my_veh, self.slots))
 		lines.append('poses: sent %d, received %d' % (self.poses_out, self.poses_in))

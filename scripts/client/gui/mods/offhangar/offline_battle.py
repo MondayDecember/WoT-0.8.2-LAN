@@ -6665,6 +6665,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			globals()['g_offh_battle_over'] = True
 			globals()['G_OFFH_FORCED_WINNER'] = winner
 			LOG_DEBUG('BATTLE OVER: %s -> winnerTeam=%s' % (reason, winner))
+			# LAN host: the same outcome for every guest
+			try:
+				_lan_e = _offh_lan()
+				if _lan_e is not None and _lan_e.role == 'host' and _lan_e.in_lan_battle:
+					_lan_e.send_end(winner, reason)
+			except Exception:
+				pass
 			try:
 				BigWorld.player().arena.onPeriodChange(4, BigWorld.serverTime() + 5.0, 5.0, {})
 			except Exception:
@@ -6698,6 +6705,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			# Only once the battle proper is running - period 3. Checking during the
 			# countdown would call a wipe before the bots have even spawned.
 			if getattr(player.arena, 'period', 0) != 3:
+				return
+			# LAN guest with its host: the host decides how the battle ends
+			if _offh_lan_guest_follows():
 				return
 			p_team = getattr(player, '_offhangar_team', 1)
 			# --- timer expiry -> draw ---
@@ -6775,6 +6785,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 					_battle_finished[0] = True
 					return
 
+				# LAN guest with its host: base capture is decided on the host, and the
+				# result arrives as the end of the battle (cleanup above still runs)
+				if _offh_lan_guest_follows():
+					return
 				# Get alive vehicles per team
 				vehs_by_team = {1: [], 2: []}
 				_mock_vehicles = globals().get('G_MOCK_VEHICLES', {})
@@ -6957,6 +6971,12 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# onBecomeNonPlayer teardown no other exit path uses ->
 						# 'capture the zone -> you win, but the game crashes'.
 						globals()['G_OFFH_FORCED_WINNER'] = 3 - base_team
+						try:
+							_lan_c = _offh_lan()
+							if _lan_c is not None and _lan_c.role == 'host' and _lan_c.in_lan_battle:
+								_lan_c.send_end(3 - base_team, 'base captured')
+						except Exception:
+							pass
 						def _capture_end():
 							try:
 								if _exit_done[0]:
@@ -10197,6 +10217,10 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_lan_dm.last_killer_id = _lan_shooter
 								_offh_sync_marker_health(_lan_dm, _p_vid)
 						else:
+							_lan_end = _lan_t.take_end()
+							if _lan_end is not None:
+								_offh_lan_dbg('battle end from host: winner %s (%s)' % (_lan_end[0], _lan_end[1]))
+								_offh_finish_battle(_lan_end[0], 'host: %s' % _lan_end[1])
 							_lan_own = _lan_t.player_state(_lan_t.my_id)
 							_lan_pm = mock_vehicles.get(_p_vid)
 							if _lan_own is not None and _lan_pm is not None:
@@ -17224,6 +17248,17 @@ def _offh_lan_bot_state(eid, m_veh, p_vid):
 	        round(mt.yaw, 3), round(mt.pitch, 3), round(mt.roll, 3),
 	        round(getattr(m_veh, '_turret_yaw', 0.0) or 0.0, 3), round(getattr(m_veh, '_gun_pitch', 0.0) or 0.0, 3),
 	        round(getattr(m_veh, '_veh_velocity', 0.0) or 0.0, 1), int(getattr(m_veh, 'health', 0) or 0), sv]
+
+
+def _offh_lan_guest_follows():
+	"""True on a guest that is in a LAN battle and still hears its host: the
+	host decides base capture and the end of the battle. Without the host the
+	guest falls back to deciding for itself."""
+	try:
+		lan = _offh_lan()
+		return lan is not None and lan.role == 'guest' and lan.in_lan_battle and bool(lan.peers)
+	except Exception:
+		return False
 
 
 def _offh_lan_guest_blocked():

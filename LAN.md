@@ -19,12 +19,21 @@ Goal: several players in one offline battle, one PC acting as the host.
 Config file `<game folder>/offhangar_user/lan.json` (created on first start):
 
 ```json
-{"role": "host", "host_ip": "127.0.0.1", "port": 27015, "name": "Igor"}
+{"role": "host", "host_ip": "127.0.0.1", "port": 27015, "name": "Igor", "key": "secret"}
 ```
 
 - `role`: `host`, `guest` or `off`
 - `host_ip`: the host's address (guests only)
 - `port`: UDP port the host listens on (open it in the firewall on the host)
+- `name`: your nickname, also used as your name in battle unless
+  `config.json` has a `nickname` of its own
+- `key`: optional session password, the same on the host and every guest;
+  the host ignores guests with a wrong or missing key
+- `uid`: your permanent player id, written on first start - leave it alone
+
+A guest connected to a host cannot start a battle itself (the hangar says
+so); the host's Battle button starts it for everyone. Without a host a guest
+plays ordinary solo battles.
 
 Status of the link: `<game folder>/offhangar_user/lanlink.txt`.
 
@@ -84,9 +93,40 @@ tank as its line-up id (which on that player's client is the player vehicle).
 - Damage a player takes locally (falls, rams) travels in its pose (`hp`) and
   lowers its tank on the host.
 
+## End of battle
+
+The host decides: team wipe, timer and base capture are evaluated on the
+host only. Its outcome (winner, reason) goes to every guest (`end`,
+reliable) and the guest finishes the battle the same way. While a guest is
+in a LAN battle and still hears its host, its own end checks and base
+capture are off; if the host disappears, the guest falls back to its own.
+
 Not synced yet: module/crew crits and fires on a guest's own tank (only hit
-points), hit sparks at the target on other clients, base capture, the
-post-battle results screen.
+points), hit sparks at the target on other clients, the base capture bar
+on guests, the post-battle results screen.
+
+## Playing over the internet
+
+With a public (white) IP on the host's router:
+
+1. Router: forward **UDP 27015** to the host PC's LAN address.
+2. Host PC: allow it in Windows Firewall (Private profile is not enough for
+   traffic from outside - use Any, or the profile of the active network):
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "WoT 0.8.2 LAN (internet)" -Direction Inbound -Protocol UDP -LocalPort 27015 -Program "C:\World_of_Tanks_0.08.02.00.00_RU_0349_SD\WorldOfTanks.exe" -Action Allow -Profile Any
+   ```
+
+3. Host `lan.json`: set a `key`.
+4. Each friend's `lan.json`: `"role": "guest"`, `"host_ip": "<host's public IP>"`,
+   the same `key`, their own `name`.
+
+Without a public IP: put everyone in one WireGuard network and use the host's
+WireGuard address as `host_ip`.
+
+Over the internet expect 30-100 ms ping: movement is smoothed, shots and
+damage are decided by the host, so a guest may see a hit register a moment
+after the tracer lands.
 
 ## Two clients on one PC
 

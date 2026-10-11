@@ -236,6 +236,17 @@ def build_offline_battle_context(player, selected_veh_inv_id, cmdName=''):
 	player_dbid = getattr(player, 'databaseID', 10000001) or 10000001
 	from gui.mods.offhangar._constants import CONFIG_OPTIONS
 	_cfg_name = CONFIG_OPTIONS.get('nickname', '')
+	# LAN: the name the other players see (lan.json 'name') is our name in
+	# battle too, unless a nickname of our own was set in config.json
+	try:
+		if not _cfg_name or str(_cfg_name) == 'Defaultplayer':
+			import sys as _sys_ln
+			_lanmod_n = _sys_ln.modules.get('gui.mods.mod_lanlink')
+			_lan_n = _lanmod_n.get() if _lanmod_n is not None else None
+			if _lan_n is not None and _lan_n.name and _lan_n.name != 'Player':
+				_cfg_name = _lan_n.name
+	except Exception:
+		pass
 	player_name = str(_cfg_name) if _cfg_name else getattr(player, 'name', 'offline_player') or 'offline_player'
 	# Prefer compDescr by selected inv id to avoid circular playerVehicleID fallback.
 	selected_compact_descr = 0
