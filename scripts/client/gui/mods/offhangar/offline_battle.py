@@ -6949,6 +6949,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							player.arena.onTeamBasePointsUpdate(base_team, 0, state['points'], _cap_broken)
 						except Exception as e:
 							__offlog.LOG_DEBUG('LOUD: Capture UI Error:', e)
+						state['lan_broken'] = bool(_cap_broken)
 					
 					if state['points'] >= 100 and not globals().get('g_offh_capture_won'):
 						globals()['g_offh_capture_won'] = True  # once-guard; popped at battle start
@@ -10223,6 +10224,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if _lan_end is not None:
 								_offh_lan_dbg('battle end from host: winner %s (%s)' % (_lan_end[0], _lan_end[1]))
 								_offh_finish_battle(_lan_end[0], 'host: %s' % _lan_end[1])
+							for _lan_ct, _lan_cv in _lan_t.take_capture_changes():
+								try:
+									player.arena.onTeamBasePointsUpdate(_lan_ct, 0, _lan_cv[0], bool(_lan_cv[1]))
+								except Exception:
+									pass
 							_lan_own = _lan_t.player_state(_lan_t.my_id)
 							_lan_pm = mock_vehicles.get(_p_vid)
 							if _lan_own is not None and _lan_pm is not None:
@@ -12083,7 +12089,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							if _lk is None: _lk = -1
 							if _lk == _p_vid: _lk = 'host'
 							_lan_pl[_lpid] = [_lhp, 1 if (_lhp > 0 and getattr(_lbm, 'isAlive', True)) else 0, _lk]
-						_lan_t.send_bots(_lan_bs, _lan_pl)
+						_lan_cap = {}
+						try:
+							for _lct, _lcs in (globals().get('g_base_capture') or {}).items():
+								_lan_cap[str(_lct)] = [int(_lcs.get('points', 0) or 0), 1 if _lcs.get('lan_broken') else 0]
+						except Exception:
+							pass
+						_lan_t.send_bots(_lan_bs, _lan_pl, _lan_cap)
 				except Exception:
 					pass
 

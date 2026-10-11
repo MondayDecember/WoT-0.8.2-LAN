@@ -235,6 +235,8 @@ class LanLink(object):
 		self.shots_in = []       # shot events to play on this client
 		self.damage_in = []      # host: (eid, dmg, pid) hits reported by guests
 		self.end_msg = None      # guest: (winner, reason) from the host
+		self.capture = {}        # guest: team -> [points, interrupted] from the host
+		self.capture_changed = {}
 		self.stats_done = None   # host: battle id already booked in lan_stats.json
 		self.shots_sent = 0
 		self.shots_got = 0
@@ -429,6 +431,16 @@ class LanLink(object):
 			pl = msg.get('pl') or {}
 			for k in pl:
 				self.players[_s(k)] = pl[k]
+			cap = msg.get('cap') or {}
+			for k in cap:
+				try:
+					team = int(k)
+					v = [int(cap[k][0]), int(cap[k][1])]
+				except Exception:
+					continue
+				if self.capture.get(team) != v:
+					self.capture[team] = v
+					self.capture_changed[team] = v
 
 		elif t == 'shot' and peer is not None:
 			if msg.get('bid') != self.battle_id:
@@ -494,6 +506,8 @@ class LanLink(object):
 		self.shots_in = []
 		self.damage_in = []
 		self.end_msg = None
+		self.capture = {}
+		self.capture_changed = {}
 		self.my_spawn = None
 		if self.role == 'host':
 			self.plan = None
@@ -690,11 +704,13 @@ class LanLink(object):
 		self.last_bots_sent = now
 		return True
 
-	def send_bots(self, states, players=None):
+	def send_bots(self, states, players=None, capture=None):
 		'''Host: one snapshot of all bots plus every player's hit points
 		(compressed when large).'''
 		self.seq += 1
 		msg = {'t': 'bots', 'bid': self.battle_id, 'n': self.seq, 'b': states, 'pl': players or {}}
+		if capture:
+			msg['cap'] = capture
 		for addr in self.peers.keys():
 			self.send(addr, dict(msg))
 		self.bots_out += 1
@@ -810,6 +826,12 @@ class LanLink(object):
 			dbg('stats saved: %s' % ', '.join(['%s %d dmg %d frags' % (r[1], r[3], r[4]) for r in rows]))
 		except Exception as e:
 			dbg('stats save failed: %r' % (e,))
+
+	def take_capture_changes(self):
+		'''Guest: [(team, [points, interrupted])] that changed since last asked.'''
+		out = list(self.capture_changed.items())
+		self.capture_changed = {}
+		return out
 
 	def take_damage(self):
 		out = self.damage_in
