@@ -1928,6 +1928,76 @@ def _offh_flush_notes():
 		q.pop(0)
 
 
+def _offh_nav_water_ready(g):
+	"""Deep water becomes blocked grid cells, so A* never routes through a lake.
+
+	The grid's ground probe cannot see water (it returns the lakebed), and the
+	upstream design left water to hand painting. With every map now measured
+	automatically (nav_grid_all_maps) nothing was painted, so routes ran
+	straight through lakes and the bots drowned. One wg_collideWater per cell,
+	150 a frame, once per map: saved as nav_dump/<map>.wet and reloaded.
+	Returns True once the water is applied (or cannot be measured)."""
+	st = globals().get('g_offh_nav_water')
+	if st is not None and st.get('g') is g and st.get('done'):
+		return True
+	try:
+		import os
+		from gui.mods.offhangar import paths as _P
+		from gui.mods.offhangar import nav_grid as _NG
+		if st is None or st.get('g') is not g:
+			st = {'g': g, 'i': 0, 'wet': bytearray(g.n), 'done': False}
+			globals()['g_offh_nav_water'] = st
+			st['path'] = os.path.join(_P.USER_DIR, 'nav_dump', '%s.wet' % g.map_name)
+			if os.path.isfile(st['path']):
+				f = open(st['path'], 'rb')
+				try:
+					data = f.read()
+				finally:
+					f.close()
+				if len(data) == g.n:
+					st['wet'] = bytearray(data)
+					st['i'] = g.n
+		wet = st['wet']
+		i = st['i']
+		end = min(g.n, i + 150)
+		while i < end:
+			if g.known[i]:
+				x, z = g.center(i)
+				if _offh_water_depth(x, g.ground[i], z) > 0.9:
+					wet[i] = 1
+			i += 1
+		st['i'] = i
+		if i < g.n:
+			return False
+		nb = 0
+		for k in range(g.n):
+			if wet[k] and g.state[k] == _NG.PASSABLE:
+				g.state[k] = _NG.BLOCKED_PAINTED
+				nb += 1
+		st['done'] = True
+		try:
+			d = os.path.dirname(st['path'])
+			if not os.path.isdir(d):
+				os.makedirs(d)
+			f = open(st['path'], 'wb')
+			try:
+				f.write(str(wet) if str is bytes else bytes(wet))
+			finally:
+				f.close()
+		except Exception:
+			pass
+		LOG_DEBUG('NAVGRID water: %d deep-water cells blocked on %s' % (nb, g.map_name))
+		return True
+	except Exception:
+		import traceback
+		LOG_DEBUG('NAVGRID water error:', traceback.format_exc())
+		st = globals().get('g_offh_nav_water') or {}
+		st['done'] = True
+		st['g'] = g
+		globals()['g_offh_nav_water'] = st
+		return True
+
+
 def _offh_nav_tick():
 	'''Build this map's navigation grid, then dump it to disk.
 
@@ -2005,7 +2075,7 @@ def _offh_nav_tick():
 						_offh_nav_note('Bot navigation: %s was measured but could '
 							'not be saved (%s) - it will be measured again next '
 							'battle.' % (g.map_name, str(_de)), 'FF6666')
-			if g.settled() and not globals().get('g_offh_nav_painted'):
+			if g.settled() and not globals().get('g_offh_nav_painted') and _offh_nav_water_ready(g):
 				# Painted keep-out areas become BLOCKED CELLS, which A* already
 				# honours - no pathfinding changes at all. Applied after the dump
 				# so the dump stays raw terrain.
@@ -2141,6 +2211,20 @@ def _offh_nav_tick():
 		LOG_DEBUG('NAVGRID init error:', str(e))
 
 
+def _offh_cov(g):
+	"""g.coverage(), cached until the grid measures something new.
+
+	coverage() sums the whole 10k-cell array, and the waypoint code asked for
+	it for every bot every frame: 27 sums, ~2.4 ms a frame in tick_profile.txt
+	- the largest single item. The answer only changes when a probe lands."""
+	k = (g.probes, g.passes)
+	c = getattr(g, '_offh_cov_c', None)
+	if c is None or c[0] != k:
+		c = (k, g.coverage())
+		g._offh_cov_c = c
+	return c[1]
+
+
 def _offh_nav_waypoint(mock, dest):
 	'''Turn a destination into the NEXT WAYPOINT along a real path.
 
@@ -2166,7 +2250,7 @@ def _offh_nav_waypoint(mock, dest):
 		import math
 		from gui.mods.offhangar import nav_grid as _NG
 		# Below this the grid has too many holes to trust for routing.
-		if g.coverage() < 0.60:
+		if _offh_cov(g) < 0.60:
 			return dest
 		px, pz = mock.position.x, mock.position.z
 		_dx, _dz = dest[0] - px, dest[2] - pz
@@ -2782,6 +2866,105 @@ def _offh_prof_move_target(mock, enemy_pos, enemy_dist, my_team):
 	except Exception as e:
 		LOG_DEBUG('PROFILE move-target error:', str(e))
 		return None
+
+
+def _offh_tactics(mock, eid, move_pos, enemy_pos, enemy_dist, my_team, mocks):
+	"""Small layer of tactics over the route system (config bot_tactics).
+
+	1. Retreat: under 30% hit points with an enemy inside 300 m, back off 50 m
+	   (away from the enemy, leaning toward the own base). The gun is aimed by
+	   separate code, so a retreating bot still shoots.
+	2. Stand and shoot: the current target is VISIBLE (the fire gate's cached
+	   line of sight) and inside this class's engagement range -> stop. Held for
+	   at least 3 s so a flickering line of sight does not make it stutter.
+	   Heavies still close to 70 m; artillery always holds.
+	3. Give way: an ally less than 10 m ahead in the direction of travel and
+	   with a lower id -> wait (max 2 s, then go anyway: no deadlocks).
+	Anything unexpected returns move_pos unchanged."""
+	try:
+		if not globals().get('g_offh_tac_on', True):
+			return move_pos
+		if globals().get('g_offh_tac_cfg') is None:
+			try:
+				from _constants import CONFIG_OPTIONS as _CFG
+				globals()['g_offh_tac_on'] = bool(_CFG.get('bot_tactics', True))
+			except Exception:
+				pass
+			globals()['g_offh_tac_cfg'] = True
+			if not globals().get('g_offh_tac_on', True):
+				return move_pos
+		import math, BigWorld
+		from gui.mods.offhangar import bot_routes as _BR
+		now = BigWorld.time()
+		px, py, pz = mock.position.x, mock.position.y, mock.position.z
+		here = (px, py, pz)
+		cls = _offh_bot_class(mock)
+		have_enemy = enemy_pos is not None and enemy_dist is not None and enemy_dist > 0.5
+
+		# 1. retreat
+		if have_enemy and cls != _BR.SPG and enemy_dist < 300.0:
+			hp = float(getattr(mock, 'health', 0) or 0)
+			mx = float(getattr(mock, 'maxHealth', 0) or 0)
+			if mx <= 0.0:
+				mx = float(getattr(getattr(mock, 'typeDescriptor', None), 'maxHealth', 0) or 0)
+			if mx > 0.0 and hp / mx < 0.30:
+				ax, az = px - enemy_pos[0], pz - enemy_pos[2]
+				al = math.sqrt(ax * ax + az * az) or 1.0
+				ax, az = ax / al, az / al
+				bx, bz = ax, az
+				own = ((globals().get('g_offline_bases', {}) or {}).get(my_team) or [])
+				if own:
+					bx, bz = own[0].x - px, own[0].z - pz
+					bl = math.sqrt(bx * bx + bz * bz) or 1.0
+					bx, bz = bx / bl, bz / bl
+				dx, dz = ax * 0.6 + bx * 0.4, az * 0.6 + bz * 0.4
+				dl = math.sqrt(dx * dx + dz * dz) or 1.0
+				mock._tac = 'retreat'
+				return (px + dx / dl * 50.0, py, pz + dz / dl * 50.0)
+
+		# 2. stand and shoot
+		hold_until = getattr(mock, '_tac_hold_until', None) or 0.0
+		if have_enemy:
+			eng = _BR.engage_range(cls)
+			if cls == _BR.SPG or (getattr(mock, '_los_ok', False) and enemy_dist <= eng):
+				hold_until = now + 3.0
+				mock._tac_hold_until = hold_until
+			if now < hold_until and enemy_dist <= eng + 40.0:
+				mock._tac = 'hold'
+				return here
+
+		# 3. give way to an ally ahead (checked 4x a second per bot)
+		if move_pos is not None:
+			if now >= (getattr(mock, '_tac_yield_chk', None) or 0.0):
+				mock._tac_yield_chk = now + 0.25
+				blocked = False
+				mx_, mz_ = move_pos[0] - px, move_pos[2] - pz
+				ml = math.sqrt(mx_ * mx_ + mz_ * mz_)
+				if ml > 3.0:
+					mx_, mz_ = mx_ / ml, mz_ / ml
+					for oeid, o in mocks.iteritems():
+						if oeid == eid or oeid >= eid or not getattr(o, 'isAlive', False):
+							continue
+						if getattr(o, '_bot_team', None) != my_team:
+							continue
+						ox, oz = o.position.x - px, o.position.z - pz
+						fwd = ox * mx_ + oz * mz_
+						if 0.0 < fwd < 10.0 and abs(ox * mz_ - oz * mx_) < 4.0:
+							blocked = True
+							break
+				if blocked:
+					if not getattr(mock, '_tac_yield_since', None):
+						mock._tac_yield_since = now
+				else:
+					mock._tac_yield_since = None
+			ys = getattr(mock, '_tac_yield_since', None)
+			if ys and now - ys < 2.0:
+				mock._tac = 'yield'
+				return here
+		mock._tac = None
+		return move_pos
+	except Exception:
+		return move_pos
 
 
 def _offh_bot_move_target(mock, enemy_pos, enemy_dist, my_team):
@@ -10528,6 +10711,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							# its CLASS picked out of the baked map. This is the line that stops
 							# all 30 tanks converging on the midpoint.
 							_move_pos = _offh_bot_move_target(m_veh, target_pos, _enemy_dist, my_team)
+							# Tactics on top of the route: back off when badly hurt, stop and
+							# shoot at a visible enemy in range, give way to allies ahead.
+							_move_pos = _offh_tactics(m_veh, eid, _move_pos, target_pos, _enemy_dist, my_team, mock_vehicles)
 							# Route the destination through the nav grid: steer at the next
 							# WAYPOINT, not straight at a place that may be behind a hill.
 							_move_pos = _offh_nav_waypoint(m_veh, _move_pos)
@@ -11504,7 +11690,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								has_limited_traverse = not (bot_gun_min_yaw <= -math.pi + 0.1 and bot_gun_max_yaw >= math.pi - 0.1)
 								
 								# TD nesmí přebíjet řízení trupu kvůli míření, pokud se právě vyhýbá překážce!
-								is_avoiding_obstacle = getattr(m_veh, '_feeler_timer', 0) > 0 or (_feeler_steer_yaw is not None if '_feeler_steer_yaw' in locals() else False)
+								# (was `'_feeler_steer_yaw' in locals()`: locals() copies every local of
+								# this huge tick into a dict - ~0.9 ms a frame at one call per bot)
+								try:
+									_fsy_now = _feeler_steer_yaw
+								except NameError:
+									_fsy_now = None
+								is_avoiding_obstacle = getattr(m_veh, '_feeler_timer', 0) > 0 or (_fsy_now is not None)
 								
 								if has_limited_traverse and not is_avoiding_obstacle:
 									# TD/Arty: pokud je cíl mimo limity, bot musí otočit celý trup

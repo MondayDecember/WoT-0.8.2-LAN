@@ -68,6 +68,14 @@ follow the host). Needs Python 3 on that PC
   second, CPU use); the launcher shows both.
 - `python bot_brain.py --selftest` checks the feeler logic.
 
+## Bot tactics and water
+
+- `bot_tactics` (default on): retreat under 30% HP, stop and shoot at a
+  visible target inside the class engagement range, give way to an ally
+  ahead. See config_defaults.json.
+- Deep water is measured once per map (`nav_dump/<map>.wet`) and blocked in
+  the navigation grid, so routes no longer run through lakes.
+
 ## Measuring where the frame goes
 
 `"profile": true` in `offhangar_user/lan.json` (solo or LAN). 45 s into the

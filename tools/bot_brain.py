@@ -29,7 +29,7 @@ import sys
 import time
 from array import array
 
-VERSION = 1
+VERSION = 2
 UNKNOWN = -30000.0
 VOID = -20000.0
 MAGIC = b'OFFHHC1\n'
@@ -195,6 +195,46 @@ class Brain(object):
         except OSError:
             pass
 
+    def handle_bin(self, data, addr):
+        kind = data[:1]
+        cur = self.maps.get(addr)
+        if kind == b'C':
+            gen, nh, nw = struct.unpack_from('<IHH', data, 1)
+            if cur is None or cur[0] != gen:
+                return
+            hm = cur[1]
+            vals = struct.unpack_from('<' + 'if' * nh + 'iB' * nw, data, 9)
+            n = len(hm.h)
+            for k in range(0, 2 * nh, 2):
+                i = vals[k]
+                if 0 <= i < n:
+                    hm.h[i] = vals[k + 1]
+            nwl = len(hm.w)
+            for k in range(2 * nh, 2 * nh + 2 * nw, 2):
+                i = vals[k]
+                if 0 <= i < nwl:
+                    hm.w[i] = vals[k + 1]
+        elif kind == b'Q':
+            gen, n = struct.unpack_from('<IH', data, 1)
+            if cur is None or cur[0] != gen:
+                return
+            hm = cur[1]
+            vals = struct.unpack_from('<' + 'iffffb' * n, data, 7)
+            flat = []
+            for k in range(0, 6 * n, 6):
+                eid, x, y, z, yaw, sign = vals[k:k + 6]
+                self.n_q += 1
+                try:
+                    r = feelers(hm, x, y, z, yaw, sign)
+                    if r is None:
+                        flat.extend((eid, 0, 0.0))
+                    else:
+                        flat.extend((eid, 1, r))
+                except Unknown:
+                    self.n_unknown += 1
+                    flat.extend((eid, 2, 0.0))
+            self.sock.sendto(b'A' + struct.pack('<IH', gen, n) + struct.pack('<' + 'iBf' * n, *flat), addr)
+
     def handle(self, m, addr):
         t = m.get('t')
         if t == 'hello':
@@ -266,7 +306,10 @@ class Brain(object):
                 self.last_msg = now
                 t0 = time.perf_counter()
                 try:
-                    self.handle(json.loads(data.decode('utf-8')), addr)
+                    if data[:1] in (b'C', b'Q'):
+                        self.handle_bin(data, addr)
+                    else:
+                        self.handle(json.loads(data.decode('utf-8')), addr)
                 except Exception:
                     pass
                 self.busy += time.perf_counter() - t0

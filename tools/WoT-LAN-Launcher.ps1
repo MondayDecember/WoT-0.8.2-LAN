@@ -86,6 +86,12 @@ function Start-Brain {
     if (-not (Test-Path $brainScript)) { $script:brainNote = 'Мозг ботов: нет bot_brain.py рядом с игрой - боты считаются в игре.'; return }
     $py = Find-Python3
     if (-not $py) { $script:brainNote = 'Мозг ботов: не найден Python 3 - боты считаются в игре (как раньше).'; return }
+    # A brain left over from an older version would hold the port: restart it.
+    try {
+        Get-CimInstance Win32_Process -Filter "Name like 'py%'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'bot_brain\.py' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
     $args2 = @($py[1]) + @("`"$brainScript`"", '--dir', "`"$GameDir`"")
     try {
         Start-Process -FilePath $py[0] -ArgumentList $args2 -WindowStyle Hidden | Out-Null

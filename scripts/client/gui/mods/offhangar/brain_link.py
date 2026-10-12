@@ -284,8 +284,7 @@ class BrainLink(object):
         if ls is None or (x - ls[0]) ** 2 + (z - ls[1]) ** 2 > RESCAN_MOVE * RESCAN_MOVE:
             self.last_scan[eid] = (x, z)
             c.want_around(x, z, y)
-        self.out_q.append([int(eid), round(x, 2), round(y, 2), round(z, 2), round(yaw, 4),
-                           1 if turn_sign > 0 else -1])
+        self.out_q.append((int(eid), x, y, z, yaw, 1 if turn_sign > 0 else -1))
         self.stats['asked'] += 1
 
     def take(self, eid):
@@ -322,16 +321,36 @@ class BrainLink(object):
                        'file': os.path.abspath(self.cache_path) if self.cache_path else None})
             self._send(hd)
         if c is not None and self.map_ok_gen == self.gen:
+            # Binary, not JSON: Python 2.6's json encoder is pure Python and
+            # cost ~1 ms a frame here (tick_profile.txt); struct is C.
             while c.new_h or c.new_w:
-                hs, c.new_h = c.new_h[:150], c.new_h[150:]
-                ws, c.new_w = c.new_w[:150], c.new_w[150:]
-                self._send({'t': 'cells', 'gen': self.gen, 'h': hs, 'w': ws})
+                hs, c.new_h = c.new_h[:1000], c.new_h[1000:]
+                ws, c.new_w = c.new_w[:1000], c.new_w[1000:]
+                flat = []
+                for i, v in hs:
+                    flat.append(i)
+                    flat.append(v)
+                for i, v in ws:
+                    flat.append(i)
+                    flat.append(v)
+                self._send_raw(b'C' + struct.pack('<IHH', self.gen, len(hs), len(ws))
+                               + struct.pack('<' + 'if' * len(hs) + 'iB' * len(ws), *flat))
             q = self.out_q
             while q:
-                part, q = q[:40], q[40:]
-                self._send({'t': 'q', 'gen': self.gen, 'b': part})
+                part, q = q[:200], q[200:]
+                flat = []
+                for r in part:
+                    flat.extend(r)
+                self._send_raw(b'Q' + struct.pack('<IH', self.gen, len(part))
+                               + struct.pack('<' + 'iffffb' * len(part), *flat))
         self.out_q = []
         self._poll()
+
+    def _send_raw(self, data):
+        try:
+            self.sock.sendto(data, self.addr)
+        except Exception:
+            pass
 
     def _send(self, msg):
         try:
@@ -345,6 +364,20 @@ class BrainLink(object):
                 data, addr = self.sock.recvfrom(65535)
             except Exception:
                 return
+            if data[:1] == b'A':
+                try:
+                    gen, n = struct.unpack_from('<IH', data, 1)
+                    if gen != self.gen:
+                        continue
+                    vals = struct.unpack_from('<' + 'iBf' * n, data, 7)
+                except Exception:
+                    continue
+                now = self.clock()
+                ans = self.answers
+                for k in range(0, 3 * n, 3):
+                    kind = vals[k + 1]
+                    ans[vals[k]] = (now, None if kind == 0 else (vals[k + 2] if kind == 1 else '?'))
+                continue
             try:
                 m = json.loads(data.decode('utf-8'))
             except Exception:
