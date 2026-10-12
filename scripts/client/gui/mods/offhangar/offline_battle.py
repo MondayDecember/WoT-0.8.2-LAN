@@ -1045,6 +1045,169 @@ def _offh_water_depth(x, y, z):
 	return 20.0 - _w
 
 
+def _offh_retail_space_setup(space_id):
+	"""What the real PlayerAvatar.onEnterWorld does for a battle space, and
+	the offline battle never did (it runs without an Avatar entity).
+
+	* Space items visibility mask = the standard battle (ctf). Every map's
+	  chunks carry the bases, spawn markers and props of ALL gameplay types
+	  (Malinovka: 6 base flags for ctf, encounter, assault...), each tagged
+	  with a mask; the server normally tells the client which type is played.
+	  Unset, the client showed all of them - the "heap of bases".
+	* Umbra occlusion culling on, as every 0.8.2 arena_defs file asks
+	  (umbraEnabled 1): objects hidden behind buildings and hills are not drawn.
+	Both are native calls of this client (found in WorldOfTanks.exe); if a
+	signature differs, the call is skipped and logged."""
+	try:
+		from _constants import CONFIG_OPTIONS as _CFG
+		if not bool(_CFG.get('retail_space_setup', True)):
+			return
+	except Exception:
+		pass
+	import BigWorld
+	_ctf_mask = 1          # ArenaType.getVisibilityMask(ARENA_GAMEPLAY_IDS['ctf'])
+	_done = []
+	try:
+		BigWorld.wg_setSpaceItemsVisibilityMask(space_id, _ctf_mask)
+		_done.append('mask(space,1)')
+	except TypeError:
+		try:
+			BigWorld.wg_setSpaceItemsVisibilityMask(_ctf_mask)
+			_done.append('mask(1)')
+		except Exception as _e:
+			_done.append('mask failed: %s' % _e)
+	except Exception as _e:
+		_done.append('mask failed: %s' % _e)
+	try:
+		BigWorld.wg_setUmbraEnabled(True)
+		_done.append('umbra on')
+	except Exception as _e:
+		_done.append('umbra failed: %s' % _e)
+	LOG_DEBUG('RETAIL space setup: %s' % ', '.join(_done))
+
+
+# --- Retail spawn points ------------------------------------------------------
+# spawn_points.json (shipped with the mod, made by tools/extract/extract_spawns.py
+# from the maps' own chunk files): the server's SpawnPoint objects of the
+# standard battle, 30 per team per map, each with a preferred vehicle class
+# (heavyTank / mediumTank / lightTank / AT-SPG / SPG / <any>) and WG's facing.
+
+def _offh_spawn_db():
+	db = globals().get('g_offh_spawn_db')
+	if db is not None:
+		return db
+	db = {}
+	try:
+		import os, json
+		_p = os.path.join(os.path.dirname(__file__), 'spawn_points.json')
+		if os.path.isfile(_p):
+			_f = open(_p, 'rb')
+			try:
+				db = json.loads(_f.read().decode('utf-8'))
+			finally:
+				_f.close()
+	except Exception:
+		import traceback
+		LOG_DEBUG('spawn_points.json unreadable:', traceback.format_exc())
+		db = {}
+	globals()['g_offh_spawn_db'] = db
+	return db
+
+
+def _offh_vclass(tags):
+	"""Vehicle class tag of a vehicle (tags set/frozenset) in spawn point terms."""
+	try:
+		for _c in ('SPG', 'AT-SPG', 'heavyTank', 'mediumTank', 'lightTank'):
+			if _c in tags:
+				return _c
+	except Exception:
+		pass
+	return None
+
+
+def _offh_retail_point(t_id, slot, cls=None):
+	"""(x, z, yaw) of a retail spawn point for this team's line-up slot, or None
+	when the map has none (the caller falls back to the formation grid).
+	A slot keeps its point for the whole battle; the vehicle class picks a
+	matching point first, then a '<any>' one, then whatever is left."""
+	try:
+		from _constants import CONFIG_OPTIONS as _CFG
+		if not bool(_CFG.get('retail_spawns', True)):
+			return None
+		import BigWorld, random
+		_gen = globals().get('g_offh_battle_gen', 0)
+		pools = globals().get('g_offh_spawn_pools')
+		if pools is None or pools.get('_gen') != _gen:
+			_mn = getattr(BigWorld.player().arena.arenaType, 'geometryName', '') or ''
+			_mn = str(_mn).replace('\\', '/').rstrip('/').split('/')[-1]
+			_m = _offh_spawn_db().get(_mn) or {}
+			pools = {'_gen': _gen, '_map': _mn}
+			# LAN: host and guests must hand out the SAME points, so the shuffle is
+			# seeded by the shared battle id and the players' slots (0 = host,
+			# 1.. = guests) are reserved first, before any class-based pick can
+			# make the order differ between the clients.
+			_rng = random
+			_reserve = 0
+			try:
+				_lan = _offh_lan()
+				if _lan is not None and getattr(_lan, 'in_lan_battle', False) and getattr(_lan, 'battle_id', None):
+					_rng = random.Random('%s|%s' % (_mn, _lan.battle_id))
+					_reserve = max([0] + [int(v) for v in (getattr(_lan, 'slots', None) or {}).values()]) + 1
+			except Exception:
+				pass
+			for _t in (1, 2):
+				_free = [s for s in (_m.get('spawns') or []) if int(s.get('team', 0)) == _t]
+				_free.sort(key=lambda s: (s.get('x'), s.get('z')))
+				_rng.shuffle(_free)
+				pools[_t] = {'free': _free, 'slots': {}}
+			globals()['g_offh_spawn_pools'] = pools
+			if _reserve:
+				_pt = getattr(BigWorld.player(), '_offhangar_team', 1) or 1
+				for _sl in range(_reserve):
+					_offh_retail_point(_pt, _sl, '<any>')
+			LOG_DEBUG('RETAIL spawns for %s: team1 %d, team2 %d points'
+				% (_mn, len(pools[1]['free']), len(pools[2]['free'])))
+		pool = pools.get(t_id)
+		if not pool:
+			return None
+		if slot in pool['slots']:
+			return pool['slots'][slot]
+		free = pool['free']
+		if not free:
+			return None
+		if cls is None and slot == 0:
+			try:
+				_pl = BigWorld.player()
+				if t_id == (getattr(_pl, '_offhangar_team', 1) or 1):
+					cls = _offh_vclass(_pl.vehicleTypeDescriptor.type.tags)
+			except Exception:
+				cls = None
+		pick = None
+		for want in ((cls,) if cls else ()) + ('<any>',):
+			for i, s in enumerate(free):
+				if s.get('cls') == want:
+					pick = free.pop(i)
+					break
+			if pick is not None:
+				break
+		if pick is None:
+			# SPG points are behind the lines: never hand one to a tank that is
+			# not artillery while anything else is left.
+			for i, s in enumerate(free):
+				if s.get('cls') != 'SPG' or cls == 'SPG':
+					pick = free.pop(i)
+					break
+		if pick is None:
+			pick = free.pop(0)
+		res = (float(pick['x']), float(pick['z']), float(pick['yaw']))
+		pool['slots'][slot] = res
+		return res
+	except Exception:
+		import traceback
+		LOG_DEBUG('retail spawn point error:', traceback.format_exc())
+		return None
+
+
 def _offh_spawn_spot_check(x, z):
 	'''Is (x, z) a clean place to put a tank down?
 
@@ -5413,6 +5576,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 		globals()['g_offh_battle_space'] = space_id
 		globals()['g_offh_battle_mapping'] = _offh_mh
 		globals()['g_offh_battle_mapname'] = map_name
+		_offh_retail_space_setup(space_id)
 		# The spaceID is reused between battles, so the per-space reset
 		# heuristics in the destructibles ledger / tree registry never fire
 		# on their own: reset explicitly or the dedup sets grow forever and
@@ -16627,9 +16791,13 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 			# only carry teamSpawnPoints for the domination mode). The line-up is a
 			# 5x3 grid behind the flag, 9 m spacing, facing the enemy base, with the
 			# heavies up front and artillery at the back. bots_per_team in config.json.
-			def _formation_slot(t_id, slot):
+			def _formation_slot(t_id, slot, cls=None):
 				# Returns (x, z, yaw) for a line-up slot of the given team.
 				# Slot 0 = front row centre (the player's own slot in his team).
+				# The map's own retail spawn points come first (spawn_points.json).
+				_rp = _offh_retail_point(t_id, slot, cls)
+				if _rp is not None:
+					return _rp
 				import math
 				_sp = globals().get('g_offline_spawns', {}) or {}
 				_bs = globals().get('g_offline_bases', {}) or {}
@@ -16740,6 +16908,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						# Pick the bots' vehicles up front and sort heavy -> arty so the
 						# front rows hold the heavies and artillery sits at the back
 						_veh_names = []
+						_veh_cls = []
 						try:
 							import random as _rnd
 							from items import vehicles as _veh_items
@@ -16772,11 +16941,16 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 								_rnd.shuffle(_picked)
 								_picked.sort(key=_class_key)
 								_veh_names = [_p['name'] for _p in _picked]
+								_veh_cls = [_offh_vclass(_p['tags']) for _p in _picked]
 						except Exception:
 							import traceback
 							LOG_DEBUG('AUTO-SPAWN vehicle pick failed:', traceback.format_exc())
 						for _i in range(_count):
-							_sx, _sz, _yw = _formation_slot(_t, _slot0 + _i)
+							try:
+								_vc = _veh_cls[_i]
+							except Exception:
+								_vc = None
+							_sx, _sz, _yw = _formation_slot(_t, _slot0 + _i, _vc)
 							_vn = _veh_names[_i] if _i < len(_veh_names) else None
 							_jobs.append((_t, _sx, _sz, _yw, _vn))
 					

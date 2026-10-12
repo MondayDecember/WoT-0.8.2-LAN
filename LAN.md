@@ -68,6 +68,19 @@ follow the host). Needs Python 3 on that PC
   second, CPU use); the launcher shows both.
 - `python bot_brain.py --selftest` checks the feeler logic.
 
+## Retail spawns, one set of bases, occlusion culling
+
+From reading the client (see GAME_CODE.md):
+
+- `retail_spawns`: the maps' own spawn points of the standard battle (30 per
+  team, with WG's preferred class per point) instead of a grid around the
+  flag. In a LAN battle host and guests shuffle them with the shared battle
+  id and reserve the players' slots first, so everyone agrees who stands
+  where.
+- `retail_space_setup`: only the standard battle's map objects are shown
+  (no extra base flags of encounter / assault battles) and Umbra occlusion
+  culling is on, as the real client does on entering a battle.
+
 ## Bot tactics and water
 
 - `bot_tactics` (default on): retreat under 30% HP, stop and shoot at a
