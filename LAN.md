@@ -77,6 +77,11 @@ follow the host). Needs Python 3 on that PC
   reverse blindly every 2 s). A bot that makes under 4 m of progress in 6 s
   while driving (typically a slope too steep) blocks the nav cell ahead for
   2 minutes and replans around it.
+- Learned stuck spots: every such stuck event (with no other tank within
+  9 m - a jam is not the terrain's fault) is counted per nav cell in
+  `nav_dump/<map>.stuck`. A cell seen twice stays blocked in every later
+  battle on that map (at most 3% of the drivable cells). The battle chat says
+  how many learned spots a map has. Delete the file to forget a map.
 - Deep water is measured once per map (`nav_dump/<map>.wet`) and blocked in
   the navigation grid, so routes no longer run through lakes.
 

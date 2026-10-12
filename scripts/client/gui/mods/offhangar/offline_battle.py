@@ -2084,6 +2084,8 @@ def _offh_nav_tick():
 				# honours - no pathfinding changes at all. Applied after the dump
 				# so the dump stays raw terrain.
 				globals()['g_offh_nav_painted'] = True
+				# Spots where bots got stuck in earlier battles (learned, per map).
+				_offh_stuck_apply(g)
 				# Painted areas are the ONLY thing that blocks. The grid states
 				# no opinion of its own about where a tank may go.
 				_pf = globals().get('g_offh_profile')
@@ -2906,13 +2908,119 @@ def _offh_unstick(mock, intends, heading):
 		i = g.cell_at(px + math.sin(heading) * g.cell, pz + math.cos(heading) * g.cell)
 		if i is not None and g.state[i] == _NG.PASSABLE and i != g.cell_at(px, pz):
 			g.state[i] = _NG.BLOCKED_PAINTED
-			globals().setdefault('g_offh_tmp_blocks', []).append((now + 120.0, i, g))
+			# Learn it for good unless other tanks are what blocked us (a jam
+			# says nothing about the terrain). Second time on the same spot ->
+			# it stays blocked in every later battle on this map.
+			if _offh_stuck_learn(g, i, mock) < 2:
+				globals().setdefault('g_offh_tmp_blocks', []).append((now + 120.0, i, g))
 		mock._nav_wp = None
 		mock._nav_dest = None
 		mock._unstuck_n = (getattr(mock, '_unstuck_n', 0) or 0) + 1
 		LOG_DEBUG('UNSTICK bot=%s no progress for 6 s - cell %s blocked, replanning' % (getattr(mock, 'id', '?'), i))
 	except Exception:
 		pass
+
+
+# --- Learned stuck spots ----------------------------------------------------
+# offhangar_user/nav_dump/<map>.stuck (JSON): per nav cell, how many times a bot
+# got stuck pushing into it. Seen twice -> blocked in every later battle, so the
+# bots stop trying the same impossible slope. Delete the file to forget a map.
+STUCK_LEARN_AT = 2
+STUCK_MAX_SHARE = 0.03      # never learn-block more than 3% of the drivable cells
+
+
+def _offh_stuck_mem(g):
+	m = globals().get('g_offh_stuck_mem')
+	if m is not None and m.get('g') is g:
+		return m
+	import os, json
+	from gui.mods.offhangar import paths as _P
+	m = {'g': g, 'cnt': {}, 'path': os.path.join(_P.USER_DIR, 'nav_dump', '%s.stuck' % g.map_name)}
+	try:
+		if os.path.isfile(m['path']):
+			f = open(m['path'], 'rb')
+			try:
+				d = json.loads(f.read().decode('utf-8'))
+			finally:
+				f.close()
+			if d.get('nx') == g.nx and d.get('nz') == g.nz:
+				for k, v in (d.get('cnt') or {}).items():
+					m['cnt'][int(k)] = int(v)
+	except Exception:
+		pass
+	globals()['g_offh_stuck_mem'] = m
+	return m
+
+
+def _offh_stuck_save(m):
+	try:
+		import os, json
+		g = m['g']
+		d = os.path.dirname(m['path'])
+		if not os.path.isdir(d):
+			os.makedirs(d)
+		f = open(m['path'], 'wb')
+		try:
+			cnt = {}
+			for k, v in m['cnt'].items():
+				cnt[str(k)] = v
+			f.write(json.dumps({'map': g.map_name, 'nx': g.nx, 'nz': g.nz, 'cnt': cnt}).encode('utf-8'))
+		finally:
+			f.close()
+	except Exception:
+		pass
+
+
+def _offh_stuck_cap(g):
+	from gui.mods.offhangar import nav_grid as _NG
+	n = 0
+	for s in g.state:
+		if s == _NG.PASSABLE:
+			n += 1
+	return max(5, int(n * STUCK_MAX_SHARE))
+
+
+def _offh_stuck_apply(g):
+	"""Block every learned spot of this map (called once the grid is ready)."""
+	try:
+		from gui.mods.offhangar import nav_grid as _NG
+		m = _offh_stuck_mem(g)
+		spots = sorted([(v, k) for k, v in m['cnt'].items() if v >= STUCK_LEARN_AT], reverse=True)
+		spots = spots[:_offh_stuck_cap(g)]
+		nb = 0
+		for v, i in spots:
+			if 0 <= i < g.n and g.state[i] == _NG.PASSABLE:
+				g.state[i] = _NG.BLOCKED_PAINTED
+				nb += 1
+		m['applied'] = nb
+		LOG_DEBUG('STUCK memory: %d learned spots blocked on %s (%d recorded)' % (nb, g.map_name, len(m['cnt'])))
+		if nb:
+			_offh_nav_note('Боты помнят неудобные места на этой карте: %d.' % nb, '66DD66')
+	except Exception:
+		import traceback
+		LOG_DEBUG('STUCK apply error:', traceback.format_exc())
+
+
+def _offh_stuck_learn(g, i, mock):
+	"""Count a stuck event at cell i; returns the new count (0 = not learned)."""
+	try:
+		px, pz = mock.position.x, mock.position.z
+		for o in (globals().get('G_MOCK_VEHICLES') or {}).values():
+			if o is mock or not getattr(o, 'isAlive', False):
+				continue
+			if (o.position.x - px) ** 2 + (o.position.z - pz) ** 2 < 81.0:
+				return 0        # another tank within 9 m: a jam, not the terrain
+		m = _offh_stuck_mem(g)
+		c = m['cnt'].get(i, 0) + 1
+		m['cnt'][i] = c
+		if c >= STUCK_LEARN_AT and m.get('applied', 0) >= _offh_stuck_cap(g):
+			return 1            # learned enough on this map already: keep it temporary
+		if c == STUCK_LEARN_AT:
+			m['applied'] = m.get('applied', 0) + 1
+		_offh_stuck_save(m)
+		return c
+	except Exception:
+		return 0
 
 
 def _offh_tmp_blocks_expire(now):
