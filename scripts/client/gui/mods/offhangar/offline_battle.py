@@ -1361,13 +1361,63 @@ def _offh_brain():
 		return None
 
 
+def _offh_bots_status():
+	'''With "profile": true in lan.json: every 5 s, one line per bot into
+	offhangar_user/bots_status.txt - what it is doing and why, so a battle
+	where bots stand around can be explained from one file.'''
+	try:
+		import BigWorld, os, math
+		now = BigWorld.time()
+		if now - (globals().get('g_offh_bstat_t') or 0.0) < 5.0:
+			return
+		globals()['g_offh_bstat_t'] = now
+		if not _offh_profile_wanted():
+			return
+		from gui.mods.offhangar import paths as _P
+		mocks = globals().get('G_MOCK_VEHICLES') or {}
+		lines = ['%s  period %s  map %s  no shot for %.0f s' % (
+			__import__('time').strftime('%H:%M:%S'), globals().get('g_offh_period'),
+			globals().get('g_offh_battle_mapname'), _offh_lull())]
+		lines.append('id  team class  hp   km/h  tactic  goal_m  src  held/closing  wps  escape  unstuck  navfail')
+		for eid in sorted(mocks.keys()):
+			m = mocks[eid]
+			if not getattr(m, '_bot_team', None):
+				continue
+			if not getattr(m, 'isAlive', False):
+				lines.append('%-3s %s dead' % (eid, getattr(m, '_bot_team', '?')))
+				continue
+			wp = getattr(m, '_nav_wp', None)
+			nd = getattr(m, '_nav_dest', None)
+			gd = -1.0
+			if nd:
+				gd = math.sqrt((nd[0] - m.position.x) ** 2 + (nd[2] - m.position.z) ** 2)
+			lines.append('%-3s %-4s %-6s %-4d %5.1f  %-6s  %6.0f  %-14s %s/%s  %3d  %3d  %3d  %s' % (
+				eid, getattr(m, '_bot_team', '?'), _offh_bot_class(m), int(getattr(m, 'health', 0) or 0),
+				abs(getattr(m, '_veh_velocity', 0.0) or 0.0) * 3.6, getattr(m, '_tac', None) or '-', gd,
+				str(getattr(m, '_mv_src_sig', None))[:14], int(bool(getattr(m, '_prof_held', False))),
+				int(bool(getattr(m, '_prof_closing', False))), len(wp) if wp else 0,
+				getattr(m, '_wall_escape', 0) or 0, getattr(m, '_unstuck_n', 0) or 0,
+				'yes' if getattr(m, '_nav_faildest', None) else '-'))
+		f = open(os.path.join(_P.USER_DIR, 'bots_status.txt'), 'w')
+		try:
+			f.write('\n'.join(lines) + '\n')
+		finally:
+			f.close()
+	except Exception:
+		pass
+
+
 def _offh_brain_tick(player):
 	"""Once a frame on a client whose bots think (host / solo): give the brain
 	this battle's map, measure ground around the bots, exchange messages."""
 	try:
-		globals()['g_offh_period'] = getattr(player.arena, 'period', 3)
+		_per = getattr(player.arena, 'period', 3)
+		if _per < 3:
+			globals()['g_offh_last_shot'] = None     # countdown: the lull clock starts with the battle
+		globals()['g_offh_period'] = _per
 	except Exception:
 		pass
+	_offh_bots_status()
 	_bl = _offh_brain()
 	if _bl is None:
 		return
@@ -2801,6 +2851,47 @@ def _offh_bot_can_see(mock, tx, tz, td):
 # briefly blocked tank is never cut short, short enough that nobody watches a
 # bot idle for a whole battle.
 _PROF_STALL_FRAMES = 240
+# Nobody has fired for this long (s): every bot that is holding a position
+# (except artillery) moves up on the nearest enemy until shooting starts again.
+LULL_PUSH_S = 45.0
+
+
+def _offh_lull():
+	'''Seconds since anyone in the battle last fired (0 at battle start).'''
+	try:
+		import BigWorld
+		now = BigWorld.time()
+	except Exception:
+		return 0.0
+	t = globals().get('g_offh_last_shot')
+	if t is None or t > now:
+		globals()['g_offh_last_shot'] = now
+		return 0.0
+	return now - t
+
+
+def _offh_should_advance(mock, cls, enemy_pos, enemy_dist):
+	'''A bot standing at its chosen spot: move up on the enemy instead?
+
+	Holding used to mean holding until an enemy was BOTH within 400 m and
+	further than the class's fighting range. In a city that never resolves: a
+	TD (range 400 m) with an enemy 200 m away behind houses, or a medium 150 m
+	from one, stood there all battle without a target - the "nobody moves"
+	battles. Now a holder advances when the enemy is in its range but it cannot
+	SEE it (the tactics layer stops it again the moment it can), and after
+	LULL_PUSH_S seconds without a single shot everyone but artillery pushes.'''
+	try:
+		from gui.mods.offhangar import bot_routes as _BR
+		if cls == _BR.SPG or enemy_pos is None or enemy_dist is None:
+			return False
+		eng = _BR.engage_range(cls)
+		if enemy_dist > eng:
+			return enemy_dist <= _BR.HOLD_RANGE or _offh_lull() > LULL_PUSH_S
+		import BigWorld
+		fresh = (BigWorld.time() - (getattr(mock, '_los_t', None) or 0.0)) < 1.5
+		return not (fresh and getattr(mock, '_los_ok', False))
+	except Exception:
+		return False
 
 
 def _offh_prof_lists(prof, team, cls):
@@ -3059,8 +3150,7 @@ def _offh_prof_move_target(mock, enemy_pos, enemy_dist, my_team):
 			# already where it wants to be. Each class closes to its own
 			# engagement distance and fights there.
 			_eng = _BR.engage_range(cls)
-			if (enemy_pos is not None and enemy_dist is not None
-					and enemy_dist <= _BR.HOLD_RANGE and enemy_dist > _eng):
+			if _offh_should_advance(mock, cls, enemy_pos, enemy_dist):
 				if not getattr(mock, '_prof_closing', False):
 					mock._prof_closing = True
 					LOG_DEBUG('PROFILE close: bot=%s class=%s at its painted spot, '
@@ -3431,6 +3521,8 @@ def _offh_bot_move_target(mock, enemy_pos, enemy_dist, my_team):
 			# position makes the driver stop, and the gun is aimed by separate
 			# code, so the bot holds the ground it picked instead of walking off
 			# it. Only once nothing is left nearby does it move up.
+			if _offh_should_advance(mock, _offh_bot_class(mock), enemy_pos, enemy_dist):
+				return enemy_pos
 			if enemy_dist is not None and enemy_dist <= _BR.HOLD_RANGE:
 				return here
 			nxt = rm.next_from(idx, _offh_route_rng())
@@ -12257,6 +12349,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_BLED.get().note_shot(getattr(m_veh, 'id', -1))
 								except Exception:
 									pass
+								globals()['g_offh_last_shot'] = BigWorld.time()
 								if m_veh._ai_clip_size > 1:
 									m_veh._ai_clip -= 1
 									if m_veh._ai_clip <= 0:
@@ -14926,6 +15019,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 						_BLED.get().note_shot(getattr(BigWorld.player(), 'playerVehicleID', -1), idx)
 					except Exception:
 						pass
+					globals()['g_offh_last_shot'] = BigWorld.time()
 					import math
 					# THE CIRCLE THIS SHELL IS SCATTERED IN, captured before the shot's own
 					# bloom widens it. The bloom belongs to the NEXT round: retail fires with
