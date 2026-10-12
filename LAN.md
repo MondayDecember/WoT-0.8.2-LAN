@@ -209,6 +209,22 @@ The host books every LAN battle into `offhangar_user/lan_stats.json` by
 player uid: battles, wins, draws, damage, frags, survived, last played.
 The launcher's Статистика tab shows it.
 
+## Graphics quality
+
+The in-game settings dialog of this client fails offline (python.log:
+`settingsDialog is not found in flash`, then a TypeError in
+GraphicsResolutions.applyChanges), so the quality stayed wherever
+preferences.xml had it. The launcher's **Графика** list writes the game's own
+presets (system/data/graphics_settings_presets.xml in misc.pkg: maximum,
+high, medium, low, minimum) into
+`%APPDATA%\Wargaming.net\WorldOfTanks\preferences.xml` before starting the
+game (backup: `preferences.xml.bak`). "Низкая" and "Минимум" also switch to
+the standard render pipeline.
+
+The launcher also repairs `offhangar_user/config.json` when it is not JSON at
+all (a crash once left it as 14 KB of zero bytes, and the mod then silently
+ran on defaults, ignoring every setting).
+
 ## Launcher
 
 Copy `tools/WoT-LAN-Launcher.ps1` and `tools/WoT LAN.cmd` into the game

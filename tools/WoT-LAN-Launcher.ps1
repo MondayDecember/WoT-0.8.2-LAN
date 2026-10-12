@@ -58,6 +58,12 @@ function Set-BotsPerTeam([int]$n) {
             if (Test-Path $modDefPath) { Copy-Item $modDefPath $modCfgPath } else { [System.IO.File]::WriteAllText($modCfgPath, '{}') }
         }
         $t = [System.IO.File]::ReadAllText($modCfgPath)
+        # A file that is not JSON at all (seen: 14 KB of zero bytes after a crash)
+        # makes the mod silently run on defaults - put the shipped defaults back.
+        if ($t -notmatch '^\s*\{' -and (Test-Path $modDefPath)) {
+            Copy-Item $modDefPath $modCfgPath -Force
+            $t = [System.IO.File]::ReadAllText($modCfgPath)
+        }
         if ($t -match '"bots_per_team"\s*:\s*\d+') {
             $t = [regex]::Replace($t, '"bots_per_team"\s*:\s*\d+', ('"bots_per_team": ' + $n))
         } else {
@@ -65,6 +71,48 @@ function Set-BotsPerTeam([int]$n) {
             $t = [regex]::Replace($t, ',\s*\}\s*$', "`r`n}")
         }
         [System.IO.File]::WriteAllText($modCfgPath, $t, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+# ------------------------------------------------------------------ graphics (preferences.xml)
+# The in-game settings dialog of this client is broken offline (python.log:
+# 'settingsDialog is not found in flash'), so the quality could not be changed.
+# These are the game's own presets, from res/packages/misc.pkg
+# system/data/graphics_settings_presets.xml: maximum, high, medium, low, minimum.
+$gfxPrefs = Join-Path $env:APPDATA 'Wargaming.net\WorldOfTanks\preferences.xml'
+$gfxLabels = @('RENDER_PIPELINE','TEXTURE_QUALITY','SHADOWS_QUALITY','DECALS_QUALITY','LIGHTING_QUALITY','TERRAIN_QUALITY',
+               'WATER_QUALITY','FAR_PLANE','FLORA_QUALITY','OBJECT_LOD','SPEEDTREE_QUALITY','POST_PROCESSING_QUALITY',
+               'SNIPER_MODE_EFFECTS_QUALITY','EFFECTS_QUALITY','SNIPER_MODE_GRASS_ENABLED','VEHICLE_DUST_ENABLED','VEHICLE_TRACES_ENABLED')
+$gfxPresets = [ordered]@{
+    'Максимум' = @(0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1)
+    'Высокая'  = @(0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1)
+    'Средняя'  = @(0,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,1)
+    'Низкая'   = @(1,2,4,4,4,3,3,2,4,2,2,4,2,2,1,0,1)
+    'Минимум'  = @(1,3,4,4,4,4,3,3,4,3,3,4,3,2,0,0,0)
+}
+function Get-GfxPreset {
+    if (-not (Test-Path $gfxPrefs)) { return $null }
+    $t = [System.IO.File]::ReadAllText($gfxPrefs)
+    $cur = @()
+    foreach ($l in $gfxLabels) {
+        if ($t -match ('<label>\s*' + $l + '\s*</label>\s*<activeOption>\s*(\d+)')) { $cur += [int]$Matches[1] } else { $cur += -1 }
+    }
+    foreach ($k in $gfxPresets.Keys) {
+        if ((Compare-Object $gfxPresets[$k] $cur -SyncWindow 0) -eq $null) { return $k }
+    }
+    return $null
+}
+function Set-GfxPreset([string]$name) {
+    if (-not $gfxPresets.Contains($name) -or -not (Test-Path $gfxPrefs)) { return }
+    try {
+        $t = [System.IO.File]::ReadAllText($gfxPrefs)
+        $v = $gfxPresets[$name]
+        for ($i = 0; $i -lt $gfxLabels.Count; $i++) {
+            $pat = '(<label>\s*' + $gfxLabels[$i] + '\s*</label>\s*<activeOption>\s*)\d+'
+            $t = [regex]::Replace($t, $pat, ('${1}' + $v[$i]))
+        }
+        Copy-Item $gfxPrefs ($gfxPrefs + '.bak') -Force
+        [System.IO.File]::WriteAllText($gfxPrefs, $t, (New-Object System.Text.UTF8Encoding($false)))
     } catch { }
 }
 
@@ -321,6 +369,15 @@ $tip.SetToolTip($bBots, 'Сколько танков в каждой коман�
 $y += 36
 New-Ctl Label $tPlay 'Пароль комнаты' 20 ($y + 2) 125 24 | Out-Null; $bKey = New-Ctl TextBox $tPlay $cfg.key 150 $y 330 26; $y += 36
 New-Ctl Label $tPlay 'Комната' 20 ($y + 2) 120 24 | Out-Null;   $bRoom = New-Ctl TextBox $tPlay $cfg.room 150 $y 330 26; $y += 36
+New-Ctl Label $tPlay 'Графика' 20 ($y + 2) 120 24 | Out-Null
+$bGfx = New-Object System.Windows.Forms.ComboBox
+$bGfx.DropDownStyle = 'DropDownList'; $bGfx.SetBounds(150, $y, 200, 26); $tPlay.Controls.Add($bGfx)
+[void]$bGfx.Items.Add('Не менять')
+foreach ($k in $gfxPresets.Keys) { [void]$bGfx.Items.Add($k) }
+$curGfx = Get-GfxPreset
+if ($curGfx) { $bGfx.SelectedItem = $curGfx } else { $bGfx.SelectedIndex = 0 }
+$tip.SetToolTip($bGfx, 'Пресеты самой игры. Настройки графики в игре не работают, поэтому выбирать здесь. Ниже графика - выше FPS.')
+$y += 36
 $plHint = New-Ctl Label $tPlay '' 20 $y 470 40; $plHint.ForeColor = [System.Drawing.Color]::SteelBlue; $y += 44
 $btnPlay = New-Ctl Button $tPlay 'Играть' 20 $y 150 40
 $btnPlay.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold); $y += 50
@@ -360,6 +417,7 @@ $btnPlay.Add_Click({
     Set-CfgValue $cfg 'key' $bKey.Text
     Save-Cfg $cfg
     Set-BotsPerTeam ([int]$bBots.Value)
+    if ($bGfx.SelectedIndex -gt 0 -and -not (Get-Process WorldOfTanks -ErrorAction SilentlyContinue)) { Set-GfxPreset ([string]$bGfx.SelectedItem) }
     if (Get-Process WorldOfTanks -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe }) {
         Msg 'Игра уже запущена. Настройки сохранены, они применятся при следующем запуске.'; return
     }
