@@ -1045,6 +1045,52 @@ def _offh_water_depth(x, y, z):
 	return 20.0 - _w
 
 
+def _offh_ledger_assists(led, team_of):
+	'''{vehicleID: [assistDamage, assistKills]} from a finished battle's ledger.
+
+	The ledger records who spotted each enemy first, but nothing turned that
+	into assists, so spot-assist XP/credits and Supporter/Evileye were always
+	zero. assistDamage: damage OTHER members of your team dealt to an enemy you
+	revealed first. assistKills: enemies a teammate finished off that you had
+	revealed first or damaged. Read-only - the ledger itself is not changed, so
+	a LAN guest that loads the host's record gets the same numbers.'''
+	out = {}
+	try:
+		spotted = dict(led._spotted_by)
+		pairs = list(led._pairs.items())
+		killed = list(led._killed_by.items())
+	except Exception:
+		return out
+	for key, d in pairs:
+		shooter, victim = key
+		sp = spotted.get(victim)
+		if not sp or sp == shooter:
+			continue
+		ts = team_of.get(shooter)
+		if ts is None or ts == team_of.get(victim) or team_of.get(sp) != ts:
+			continue
+		dmg = int(d.get('damageDealt', 0) or 0)
+		if dmg > 0:
+			out.setdefault(sp, [0, 0])[0] += dmg
+	for victim, kv in killed:
+		killer = kv[0]
+		if not killer:
+			continue
+		tk = team_of.get(killer)
+		if tk is None or tk == team_of.get(victim):
+			continue
+		helpers = set()
+		if spotted.get(victim):
+			helpers.add(spotted[victim])
+		for key, d in pairs:
+			if key[1] == victim and int(d.get('damageDealt', 0) or 0) > 0:
+				helpers.add(key[0])
+		for h in helpers:
+			if h != killer and team_of.get(h) == tk:
+				out.setdefault(h, [0, 0])[1] += 1
+	return out
+
+
 def _offh_retail_space_setup(space_id):
 	"""What the real PlayerAvatar.onEnterWorld does for a battle space, and
 	the offline battle never did (it runs without an Avatar entity).
@@ -1058,10 +1104,12 @@ def _offh_retail_space_setup(space_id):
 	  (umbraEnabled 1): objects hidden behind buildings and hills are not drawn.
 	Both are native calls of this client (found in WorldOfTanks.exe); if a
 	signature differs, the call is skipped and logged."""
+	_umbra = True
 	try:
 		from _constants import CONFIG_OPTIONS as _CFG
 		if not bool(_CFG.get('retail_space_setup', True)):
 			return
+		_umbra = bool(_CFG.get('umbra', True))
 	except Exception:
 		pass
 	import BigWorld
@@ -1079,8 +1127,8 @@ def _offh_retail_space_setup(space_id):
 	except Exception as _e:
 		_done.append('mask failed: %s' % _e)
 	try:
-		BigWorld.wg_setUmbraEnabled(True)
-		_done.append('umbra on')
+		BigWorld.wg_setUmbraEnabled(_umbra)
+		_done.append('umbra %s' % ('on' if _umbra else 'off'))
 	except Exception as _e:
 		_done.append('umbra failed: %s' % _e)
 	LOG_DEBUG('RETAIL space setup: %s' % ', '.join(_done))
@@ -2261,11 +2309,12 @@ def _offh_nav_tick():
 					except Exception as _ae:
 						LOG_DEBUG('PROFILE avoid error:', str(_ae))
 				# Clearance, so routes run down the middle of a corridor rather
-				# than along the staircase edge of a painted area. apply_avoid
-				# does this itself, but a map with no paint never calls it.
+				# than along the staircase edge of water, learned stuck spots and
+				# painted areas. Always rebuilt HERE, after all of them are
+				# blocked: apply_avoid builds it before marking its own cells, so
+				# keeping that copy left painted edges without clearance.
 				try:
-					if getattr(g, 'near_wall', None) is None:
-						g.build_clearance()
+					g.build_clearance()
 				except Exception as _ce:
 					LOG_DEBUG('NAVGRID clearance error:', str(_ce))
 				# One flood fill, AFTER the paint, so "is that even reachable?"
@@ -11684,6 +11733,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 										_sdz = m_veh.position.z - veh_pos[2]
 										_sd2 = _sdx * _sdx + _sdz * _sdz
 										_seen = False
+										_spotter = _p_vid
 										if _sd2 <= 2500.0:
 											_seen = True  # 50 m proximity spot
 										elif _sd2 <= _svr * _svr:
@@ -11739,6 +11789,7 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 												_td2 = _tdx * _tdx + _tdz * _tdz
 												if _td2 <= 2500.0:
 													_seen = True  # 50 m proximity spot by an ally
+													_spotter = getattr(_tvm, 'id', -1)
 													_tvb = None
 													break
 												if _td2 <= _svr * _svr and _td2 < _tvd:
@@ -11747,8 +11798,21 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											if (not _seen) and _tvb is not None:
 												_tlos = BigWorld.wg_collideSegment(_tick_space, Math.Vector3(_tvb.position.x, _tvb.position.y + 2.5, _tvb.position.z), Math.Vector3(m_veh.position.x, m_veh.position.y + 1.5, m_veh.position.z), 128)
 												_seen = _tlos is None
+												if _seen:
+													_spotter = getattr(_tvb, 'id', -1)
 										if _seen:
 											m_veh._spot_until = BigWorld.time() + 5.0  # spot memory
+											# Results screen: who revealed this enemy FIRST (spotted
+											# count, spot XP/credits, Scout, and the assist credit
+											# worked out at the end of the battle). The ledger keeps
+											# only the first spotter, so one call per enemy is enough.
+											if not getattr(m_veh, '_offh_spot_noted', False):
+												m_veh._offh_spot_noted = True
+												try:
+													from gui.mods.offhangar import battle_ledger as _BLSP
+													_BLSP.get().note_spot(_spotter, getattr(m_veh, 'id', eid))
+												except Exception:
+													pass
 										# Re-apply the model state on every check (idempotent): a
 										# show that failed or raced the async model load left the
 										# bot invisible-while-spotted FOREVER (the change-only flip
@@ -16193,10 +16257,17 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									_led_mates = {}
 									for _mvid, _mteam in _led_team.items():
 										_led_mates.setdefault(_mteam, []).append(_mvid)
+									# Assists: damage teammates did to an enemy you spotted first,
+									# and how many such enemies a teammate then finished off.
+									_led_assist = _offh_ledger_assists(_led, _led_team) if _led is not None else {}
 									def _led_totals(_vid):
 										if _led is None:
 											return None
-										return _led.totals_for(_vid, _led_mates.get(_led_team.get(_vid, 0), ()))
+										_t = _led.totals_for(_vid, _led_mates.get(_led_team.get(_vid, 0), ()))
+										_a = _led_assist.get(_vid)
+										if _t is not None and _a:
+											_t['damageAssisted'] = int(_t.get('damageAssisted', 0) or 0) + _a[0]
+										return _t
 									
 									for vid, vinfo in getattr(player.arena, 'vehicles', {}).items():
 										if vid == v_id: continue
@@ -16346,7 +16417,14 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 											'survived': p_health > 0,
 											'aloneOnTeam': _alive_mates == 0,
 											'enemiesAlive': _alive_enemies}
-										_pops, _achv = _BMED.evaluate(vehicles_dict.get(v_id, {}), _mctx)
+										# battle_medals reads Supporter/Evileye's "minAssists 6" from
+										# damageAssisted, which is HP; the condition counts ENEMIES.
+										_mstats = dict(vehicles_dict.get(v_id, {}))
+										try:
+											_mstats['damageAssisted'] = (_led_assist.get(v_id) or (0, 0))[1]
+										except Exception:
+											_mstats['damageAssisted'] = 0
+										_pops, _achv = _BMED.evaluate(_mstats, _mctx)
 										if _achv:
 											vehicles_dict[v_id]['achievements'] = _achv
 											mock_res['personal']['achievements'] = _achv
