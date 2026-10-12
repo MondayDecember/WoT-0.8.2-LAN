@@ -73,6 +73,10 @@ follow the host). Needs Python 3 on that PC
 - `bot_tactics` (default on): retreat under 30% HP, stop and shoot at a
   visible target inside the class engagement range, give way to an ally
   ahead. See config_defaults.json.
+- A holding / yielding bot no longer trips the stuck detector (it used to
+  reverse blindly every 2 s). A bot that makes under 4 m of progress in 6 s
+  while driving (typically a slope too steep) blocks the nav cell ahead for
+  2 minutes and replans around it.
 - Deep water is measured once per map (`nav_dump/<map>.wet`) and blocked in
   the navigation grid, so routes no longer run through lakes.
 

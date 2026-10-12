@@ -1153,6 +1153,10 @@ def _offh_brain():
 def _offh_brain_tick(player):
 	"""Once a frame on a client whose bots think (host / solo): give the brain
 	this battle's map, measure ground around the bots, exchange messages."""
+	try:
+		globals()['g_offh_period'] = getattr(player.arena, 'period', 3)
+	except Exception:
+		pass
 	_bl = _offh_brain()
 	if _bl is None:
 		return
@@ -1175,7 +1179,7 @@ def _offh_brain_tick(player):
 			_c = BigWorld.wg_collideSegment(_sp, Math.Vector3(x, top, z), Math.Vector3(x, bottom, z), 128)
 			return _c[0].y if _c is not None else None
 
-		_pre = getattr(player.arena, 'period', 3) < 3
+		_pre = globals().get('g_offh_period', 3) < 3
 		_bl.frame(_ground, _offh_water_depth, 120 if _pre else 50)
 		_now = BigWorld.time()
 		if _now - (globals().get('g_offh_brain_stat_t') or 0.0) > 5.0:
@@ -2868,6 +2872,70 @@ def _offh_prof_move_target(mock, enemy_pos, enemy_dist, my_team):
 		return None
 
 
+def _offh_unstick(mock, intends, heading):
+	"""Bot that has not made 4 m of progress in 6 s while trying to drive.
+
+	Typically a hill too steep for it: the pathfinder's slope limit is an
+	average over a whole grid cell, the actual face is steeper, and the bot
+	pushes at it forever. Block the nav cell it is pushing into for 2 minutes
+	and drop its path, so A* routes it around (the road up the hill)."""
+	try:
+		import BigWorld, math
+		if globals().get('g_offh_period', 3) < 3:
+			mock._ust = None
+			return
+		now = BigWorld.time()
+		_offh_tmp_blocks_expire(now)
+		if not intends:
+			mock._ust = None
+			return
+		px, pz = mock.position.x, mock.position.z
+		w = getattr(mock, '_ust', None)
+		if w is None:
+			mock._ust = (now, px, pz)
+			return
+		if now - w[0] < 6.0:
+			return
+		mock._ust = (now, px, pz)
+		if (px - w[1]) ** 2 + (pz - w[2]) ** 2 >= 16.0:
+			return
+		g = globals().get('g_offh_navgrid')
+		if g is None or not g.settled():
+			return
+		from gui.mods.offhangar import nav_grid as _NG
+		i = g.cell_at(px + math.sin(heading) * g.cell, pz + math.cos(heading) * g.cell)
+		if i is not None and g.state[i] == _NG.PASSABLE and i != g.cell_at(px, pz):
+			g.state[i] = _NG.BLOCKED_PAINTED
+			globals().setdefault('g_offh_tmp_blocks', []).append((now + 120.0, i, g))
+		mock._nav_wp = None
+		mock._nav_dest = None
+		mock._unstuck_n = (getattr(mock, '_unstuck_n', 0) or 0) + 1
+		LOG_DEBUG('UNSTICK bot=%s no progress for 6 s - cell %s blocked, replanning' % (getattr(mock, 'id', '?'), i))
+	except Exception:
+		pass
+
+
+def _offh_tmp_blocks_expire(now):
+	if now < (globals().get('g_offh_tmp_next', 0.0) or 0.0):
+		return
+	globals()['g_offh_tmp_next'] = now + 1.0
+	lst = globals().get('g_offh_tmp_blocks')
+	if not lst:
+		return
+	try:
+		from gui.mods.offhangar import nav_grid as _NG
+		keep = []
+		for t, i, g in lst:
+			if t <= now or g is not globals().get('g_offh_navgrid'):
+				if g.state[i] == _NG.BLOCKED_PAINTED:
+					g.state[i] = _NG.PASSABLE
+			else:
+				keep.append((t, i, g))
+		globals()['g_offh_tmp_blocks'] = keep
+	except Exception:
+		globals()['g_offh_tmp_blocks'] = []
+
+
 def _offh_tactics(mock, eid, move_pos, enemy_pos, enemy_dist, my_team, mocks):
 	"""Small layer of tactics over the route system (config bot_tactics).
 
@@ -2926,7 +2994,10 @@ def _offh_tactics(mock, eid, move_pos, enemy_pos, enemy_dist, my_team, mocks):
 		hold_until = getattr(mock, '_tac_hold_until', None) or 0.0
 		if have_enemy:
 			eng = _BR.engage_range(cls)
-			if cls == _BR.SPG or (getattr(mock, '_los_ok', False) and enemy_dist <= eng):
+			# _los_ok is only refreshed while the fire gate runs: trust it for 1 s,
+			# or a bot that stopped evaluating its target would hold forever.
+			_los_fresh = (now - (getattr(mock, '_los_t', None) or 0.0)) < 1.0
+			if cls == _BR.SPG or (_los_fresh and getattr(mock, '_los_ok', False) and enemy_dist <= eng):
 				hold_until = now + 3.0
 				mock._tac_hold_until = hold_until
 			if now < hold_until and enemy_dist <= eng + 40.0:
@@ -10766,7 +10837,11 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 							_cur_escape = getattr(m_veh, '_wall_escape', None) or 0
 							_stuck_ctr = getattr(m_veh, '_stuck_ctr', 0) or 0
 							
-							if _cur_escape > 0:
+							# Standing still ON PURPOSE (holding to shoot, giving way, at the
+							# destination) is not being stuck: without this a holding bot was
+							# thrown into a blind 60-tick reverse every 2 s.
+							_standing = dist < 6.0 or getattr(m_veh, '_tac', None) in ('hold', 'yield')
+							if _cur_escape > 0 or _standing:
 								_stuck_ctr = 0
 								m_veh._last_pos = (m_veh.position.x, m_veh.position.z)
 							else:
@@ -10780,6 +10855,9 @@ def _try_spawn_battle_avatar_stub(player, cmdName):
 									m_veh._last_pos = (m_veh.position.x, m_veh.position.z)
 									_stuck_ctr = 0
 							m_veh._stuck_ctr = _stuck_ctr
+							# Slower failure the detector above cannot see: grinding at a slope
+							# it cannot climb, sliding back and forth, never getting anywhere.
+							_offh_unstick(m_veh, not _standing and _cur_escape <= 0, _mv_target_yaw)
 							
 							_escape = getattr(m_veh, '_wall_escape', None) or 0
 							if _escape > 0:
